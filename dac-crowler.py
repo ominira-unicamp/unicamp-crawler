@@ -13,7 +13,7 @@ import csv
 import os
 import time
 from dataclasses_json import dataclass_json
-
+import random
 handler = logging.StreamHandler(sys.stdout)
 logging.basicConfig(handlers=[handler])
 logger = logging.getLogger(__name__)
@@ -80,7 +80,6 @@ class Instituto:
 class Crowler:
     session: ClientSession
     async def get_soup(self, url: str ) -> BeautifulSoup:
-        
         async with self.session.get(url) as response:
             page = await response.text()
         return BeautifulSoup(page, 'html.parser')
@@ -89,7 +88,9 @@ class Crowler:
         institutos = []
         lista = soup.find(class_="lista-oferecimento").find_all(class_="item")
         for intituto in lista:
-            institutos.append(await self.extrair_instituto(intituto.find("a")["href"]))
+            url = intituto.find("a")["href"]
+            if url.rsplit("/",1)[-1] in ["IC", "FEEC", "IFGW", "IMECC", "IE", "IB", "FEM"]:
+                institutos.append(await self.extrair_instituto(url))
         return institutos
     
     async def extrair_instituto(self, url: str) -> Instituto:
@@ -103,20 +104,32 @@ class Crowler:
             dis_url = dis.find("a")["href"]
             pool.append(self.extrair_disciplina(dis_url))
             qt_added+=1
-            if(qt_added >= 10):
+            if(qt_added >= 5):
                 diciplinas.extend(await asyncio.gather(*pool))
                 pool = []
                 qt_added = 0
+                await asyncio.sleep(1)
         diciplinas.extend(await asyncio.gather(*pool))
         return Instituto(nome, diciplinas)
     
     async def extrair_disciplina(self, url: str) -> Disciplina:
-        print("Iniciado:", url.rsplit("/",2)[-2] +"/"+ url.rsplit("/",2)[-1])
-        soup = await self.get_soup(url)
-        turmas = list(map(self.extrair_turma, soup.find_all(class_="panel")))
-        codigo = soup.find("h1").text.split("-")[0].strip()
-        nome = soup.find("h1").text.split("-")[1].strip()
-        print("Completo:",url.rsplit("/",2)[-2] +"/"+ url.rsplit("/",2)[-1])
+        sleep_time = 2
+        while True:
+            try: 
+                print("Iniciado:", url.rsplit("/",2)[-2] +"/"+ url.rsplit("/",2)[-1])
+                soup = await self.get_soup(url)
+                turmas = list(map(self.extrair_turma, soup.find_all(class_="panel")))
+                codigo = soup.find("h1").text.split("-")[0].strip()
+                nome = soup.find("h1").text.split("-")[1].strip()
+                print("Completo:",url.rsplit("/",2)[-2] +"/"+ url.rsplit("/",2)[-1])
+                break
+            except Exception as e:
+                print("Erro ao extrair disciplina, tentando novamente:", url)
+                print(e)
+                print(soup)
+                self.session = RetryClient(retry_options=retry_options)
+                sleep_time = sleep_time*random.uniform(1, 2)  
+                await asyncio.sleep(sleep_time*random.uniform(1, 2))
         return Disciplina(codigo, nome, turmas)
     
     def extrair_turma(self, panel: BeautifulSoup) -> Turma:
@@ -147,7 +160,7 @@ def save_data_to_json(data : list[Instituto], filename : str) -> None:
 def save_data_to_csv(data : list[Instituto], filename : str) -> None:
     file_exists = os.path.isfile(filename)
     
-    with open(filename, 'a', newline='') as csvfile:
+    with open(filename, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         
         if not file_exists:
@@ -215,15 +228,19 @@ def load_data_from_csv(filename):
             turma.aulas.append(aula)
             turma.docentes.extend(docentes)
     return data
+def load_data_from_json(filename: str) -> list[Instituto]:
+    with open(filename, 'r') as f:
+        data = f.read()
+        return Instituto.schema().loads(data, many=True)
 
 async def main() -> None:
-    base_url = 'https://www.dac.unicamp.br/portal/caderno-de-horarios/2024/2/S/G/IC'
+    base_url = 'https://www.dac.unicamp.br/portal/caderno-de-horarios/2025/2/S/G/'
     # print(load_data_from_csv("./aulas.csv"))
     trace_config = TraceConfig()
     trace_config.on_request_start.append(on_request_start)
     async with RetryClient(retry_options=retry_options, trace_configs=[trace_config])as session:
         crowler = Crowler(session)
-        save_data_to_json( [await crowler.extrair_instituto(base_url)], "./save2024s2-2.json");
+        save_data_to_csv(await crowler.extrair_tudo(base_url), "./save2025s2.csv");
     
 
 
