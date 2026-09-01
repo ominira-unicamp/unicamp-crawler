@@ -1,0 +1,24 @@
+{
+  "name": "scrapper-aulas",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "unicamp-scrapper-lib",
+    "unicamp-scrapper-cli"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace unicamp-scrapper-lib && npm run build --workspace unicamp-scrapper-cli",
+    "test": "npm run test --workspace unicamp-scrapper-lib && npm run test --workspace unicamp-scrapper-cli"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "pino": "^10.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "prettier": "^3.9.6",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
+  }
+}
