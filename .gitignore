@@ -7,4 +7,4 @@ dist
 unicamp-scrapper-cli/dist
 unicamp-scrapper-lib/dist
 node_modules
-resultado
+/resultado/

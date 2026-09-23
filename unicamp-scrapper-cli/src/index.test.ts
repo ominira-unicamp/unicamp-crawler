@@ -17,6 +17,7 @@ test("list expõe crawlers e páginas públicas", async () => {
   assert.match(result.stdout, /^caderno-horarios\t/m);
   assert.match(result.stdout, /^cardapio-dia\t/m);
   assert.match(result.stdout, /^catalogo-curriculos\t/m);
+  assert.match(result.stdout, /^catalogo-informacoes\t/m);
   assert.match(result.stdout, /^continencia-equivalencia\t/m);
   assert.match(result.stdout, /^editais-intercambio\t/m);
 });

@@ -4,6 +4,23 @@ export type FetchOptions = {
 };
 
 export type ScraperLogFields = Record<string, unknown>;
+export type ScraperTelemetry = {
+  span<Result>(
+    name: string,
+    attributes: Record<string, string | number | boolean>,
+    operation: () => Promise<Result> | Result,
+  ): Promise<Result>;
+  count(
+    name: string,
+    value: number,
+    attributes: Record<string, string | number | boolean>,
+  ): void;
+  duration(
+    name: string,
+    valueMs: number,
+    attributes: Record<string, string | number | boolean>,
+  ): void;
+};
 
 export interface ScraperLogger {
   debug(fields: ScraperLogFields, message: string): void;
@@ -97,13 +114,18 @@ export type ScrapingContext = {
 
 export function createScrapingContext(
   fetcher: PageFetcher,
-  options: { concurrency?: number; logger?: ScraperLogger } = {},
+  options: {
+    concurrency?: number;
+    logger?: ScraperLogger;
+    telemetry?: ScraperTelemetry;
+  } = {},
 ): ScrapingContext {
   const issues: ScrapeIssue[] = [];
   const pages: PageMetadata[] = [];
   const concurrency = Math.max(1, options.concurrency ?? 4);
   const context = {} as ScrapingContext;
   const logger = options.logger ?? noopLogger;
+  const telemetry = options.telemetry;
 
   context.fetcher = fetcher;
   context.logger = logger;
@@ -120,7 +142,13 @@ export function createScrapingContext(
       "Página iniciada",
     );
     try {
-      const html = await adapter.fetch(input, context);
+      const html = telemetry
+        ? await telemetry.span(
+            "scraper.page",
+            { "scraper.adapter": adapter.id },
+            () => adapter.fetch(input, context),
+          )
+        : await adapter.fetch(input, context);
       const metadata: PageMetadata = {
         adapter: adapter.id,
         input,
@@ -149,7 +177,14 @@ export function createScrapingContext(
           );
         },
       };
-      const result = { data: adapter.parse(html, input, reporter), metadata };
+      const parsed = telemetry
+        ? await telemetry.span(
+            "scraper.parse",
+            { "scraper.adapter": adapter.id },
+            () => adapter.parse(html, input, reporter),
+          )
+        : adapter.parse(html, input, reporter);
+      const result = { data: parsed, metadata };
       pages.push(metadata);
       logger.info(
         {
@@ -159,6 +194,13 @@ export function createScrapingContext(
         },
         "Página concluída",
       );
+      telemetry?.count("scrape_pages_total", 1, {
+        adapter: adapter.id,
+        outcome: "success",
+      });
+      telemetry?.duration("scrape_page_duration_ms", Date.now() - startedAt, {
+        adapter: adapter.id,
+      });
       return result;
     } catch (error) {
       logger.error(
@@ -170,6 +212,13 @@ export function createScrapingContext(
         },
         "Falha ao carregar página",
       );
+      telemetry?.count("scrape_pages_total", 1, {
+        adapter: adapter.id,
+        outcome: "failed",
+      });
+      telemetry?.duration("scrape_page_duration_ms", Date.now() - startedAt, {
+        adapter: adapter.id,
+      });
       throw error;
     }
   };

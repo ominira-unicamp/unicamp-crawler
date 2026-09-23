@@ -4,10 +4,15 @@ import { absoluteUrl, loadHtml, normalizedText } from "./dom.js";
 const baseUrl = (year: number, semester: number) =>
   `https://www.dac.unicamp.br/portal/caderno-de-horarios/${year}/${semester}/S/G/`;
 
-export type CadernoDeHorarioInput = { year: number; semester: 1 | 2 };
+export type CadernoDeHorarioInput = {
+  year: number;
+  semester: 1 | 2;
+  instituteCode?: string;
+};
 export type CadernoDeHorarioInstitutoInput = CadernoDeHorarioInput & {
   instituteCode: string;
   url?: string;
+  name?: string;
 };
 export type CadernoDeHorarioDisciplinaInput = CadernoDeHorarioInput & {
   courseCode: string;
@@ -59,16 +64,30 @@ export function parseCadernoDeHorarioPagina(
   const $ = loadHtml(html);
   const url = cadernoDeHorarioUrl(input);
   const institutes: CadernoDeHorarioInstitutoInput[] = [];
+  const seenInstituteUrls = new Set<string>();
   $(".lista-oferecimento .item a[href]").each((_, anchor) => {
     const href = $(anchor).attr("href");
     if (!href) return;
-    const codigo = normalizedText($(anchor)).split("-")[0].trim();
-    if (codigo)
-      institutes.push({
-        ...input,
-        instituteCode: codigo,
-        url: absoluteUrl(href, url),
-      });
+    const instituteUrl = absoluteUrl(href, url);
+    const codigo = normalizedText($(anchor)).match(/^[A-Z][A-Z0-9]{1,9}/)?.[0];
+    const urlCode = new URL(instituteUrl).pathname
+      .split("/")
+      .filter(Boolean)
+      .at(-1)
+      ?.toUpperCase();
+    if (!codigo || codigo !== urlCode || seenInstituteUrls.has(instituteUrl))
+      return;
+    seenInstituteUrls.add(instituteUrl);
+    const name = normalizedText($(anchor)).replace(
+      new RegExp(`^${codigo}\\s*[-–—]?\\s*`, "i"),
+      "",
+    );
+    institutes.push({
+      ...input,
+      instituteCode: codigo,
+      url: instituteUrl,
+      name: name || undefined,
+    });
   });
   return { institutes };
 }
@@ -94,8 +113,9 @@ export function parseCadernoDeHorarioInstituto(
   input: CadernoDeHorarioInstitutoInput,
 ): CadernoDeHorarioInstitutoPage {
   const $ = loadHtml(html);
-  const name =
-    normalizedText($("h1").first()).split("-")[0].trim() || input.instituteCode;
+  const heading = normalizedText($("h1").first());
+  const [, headingName] = heading.split(/\s*[-–—]\s*/, 2);
+  const name = input.name?.trim() || headingName?.trim() || heading || input.instituteCode;
   const courses: CadernoDeHorarioDisciplinaInput[] = [];
   $(".disciplina a[href]").each((_, anchor) => {
     const href = $(anchor).attr("href");
@@ -182,7 +202,12 @@ export async function crawlCadernoDeHorario(
 ): Promise<ScrapeResult<CadernoDeHorario>> {
   const root = await context.load(cadernoDeHorarioPagina, input);
   const loaded = await context.map(
-    root.data.institutes,
+    root.data.institutes.filter(
+      (institute) =>
+        !input.instituteCode ||
+        institute.instituteCode.toLowerCase() ===
+          input.instituteCode.toLowerCase(),
+    ),
     async (instituteInput) => {
       const institute = await context.tryLoad(
         cadernoDeHorarioInstituto,

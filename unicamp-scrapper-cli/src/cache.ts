@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import type { PageCache } from "unicamp-scrapper-lib";
 
 export class SqlitePageCache implements PageCache {
+  private static readonly maxCachedContentBytes = 10 * 1024 * 1024;
   private initialization?: Promise<void>;
   private writeQueue = Promise.resolve();
 
@@ -22,14 +23,22 @@ export class SqlitePageCache implements PageCache {
   }
 
   async set(url: string, html: string): Promise<void> {
+    if (Buffer.byteLength(html, "utf8") > SqlitePageCache.maxCachedContentBytes)
+      return;
     await this.initialize();
-    const operation = this.writeQueue.then(() =>
-      this.execute(
+    let release!: () => void;
+    const previous = this.writeQueue;
+    this.writeQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      await this.execute(
         `INSERT OR REPLACE INTO pages(url, content, timestamp) VALUES (${sqlString(url)}, ${sqlString(html)}, CURRENT_TIMESTAMP);`,
-      ).then(() => undefined),
-    );
-    this.writeQueue = operation.catch(() => undefined);
-    await operation;
+      );
+    } finally {
+      release();
+    }
   }
 
   private async initialize(): Promise<void> {

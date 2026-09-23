@@ -1,6 +1,11 @@
 import { decodeBuffer } from "encoding-sniffer";
 
-import type { FetchOptions, PageFetcher, ScraperLogger } from "./core.js";
+import type {
+  FetchOptions,
+  PageFetcher,
+  ScraperLogger,
+  ScraperTelemetry,
+} from "./core.js";
 
 type QueueTask = {
   url: string;
@@ -29,6 +34,7 @@ export function createNodePageFetcher(
     maxConcurrent?: number;
     fetch?: typeof fetch;
     logger?: ScraperLogger;
+    telemetry?: ScraperTelemetry;
   } = {},
 ): PageFetcher {
   const client = options.fetch ?? fetch;
@@ -36,6 +42,7 @@ export function createNodePageFetcher(
   const minIntervalMs = options.minIntervalMs ?? 1_000;
   const maxConcurrent = Math.max(1, options.maxConcurrent ?? 1);
   const logger = options.logger;
+  const telemetry = options.telemetry;
   const queue: QueueTask[] = [];
   let active = 0;
   let nextRequestAt = 0;
@@ -89,7 +96,7 @@ export function createNodePageFetcher(
           logger?.info(
             {
               event: "scrape.request.success",
-              url: task.url,
+              ...safeUrl(task.url),
               attempt: attempt + 1,
               status: response.status,
               durationMs: Date.now() - startedAt,
@@ -97,32 +104,52 @@ export function createNodePageFetcher(
             },
             "Requisição concluída",
           );
+          telemetry?.count("scrape_http_requests_total", 1, {
+            host: safeHost(task.url),
+            status_class: `${Math.floor(response.status / 100)}xx`,
+            outcome: "success",
+          });
+          telemetry?.duration("scrape_http_request_duration_ms", Date.now() - startedAt, {
+            host: safeHost(task.url),
+          });
           return html;
         }
         if (![429, 500, 502, 503, 504].includes(response.status))
-          throw new Error(`HTTP ${response.status} em ${task.url}`);
-        lastError = new Error(`HTTP ${response.status} em ${task.url}`);
+          throw new Error(`HTTP ${response.status} em ${safeUrl(task.url).url}`);
+        lastError = new Error(`HTTP ${response.status} em ${safeUrl(task.url).url}`);
         const delayMs = retryDelay(response, attempt);
         logger?.warn(
           {
             event: "scrape.request.retry",
-            url: task.url,
+            ...safeUrl(task.url),
             attempt: attempt + 1,
             status: response.status,
             delayMs,
           },
           "Repetindo requisição",
         );
+        telemetry?.count("scrape_retries_total", 1, {
+          host: safeHost(task.url),
+          reason: `http_${response.status}`,
+        });
         await sleep(delayMs);
       } catch (error) {
         if (task.options?.signal?.aborted) throw abortError();
         lastError = error;
+        telemetry?.count("scrape_http_requests_total", 1, {
+          host: safeHost(task.url),
+          status_class: "error",
+          outcome: "failed",
+        });
+        telemetry?.duration("scrape_http_request_duration_ms", Date.now() - startedAt, {
+          host: safeHost(task.url),
+        });
         const delayMs = 1_000 * (attempt + 1);
         if (attempt + 1 < retries)
           logger?.warn(
             {
               event: "scrape.request.retry",
-              url: task.url,
+              ...safeUrl(task.url),
               attempt: attempt + 1,
               delayMs,
               err: error instanceof Error ? error.message : String(error),
@@ -133,10 +160,10 @@ export function createNodePageFetcher(
       }
     }
     logger?.error(
-      { event: "scrape.request.error", url: task.url, retries },
+      { event: "scrape.request.error", ...safeUrl(task.url), retries },
       "Requisição esgotou as tentativas",
     );
-    throw lastError ?? new Error(`Não foi possível baixar ${task.url}`);
+    throw lastError ?? new Error(`Não foi possível baixar ${safeUrl(task.url).url}`);
   };
 
   return {
@@ -147,6 +174,23 @@ export function createNodePageFetcher(
       });
     },
   };
+}
+
+function safeHost(url: string) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "invalid";
+  }
+}
+
+function safeUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    return { url: `${parsed.origin}${parsed.pathname}`, host: parsed.host, path: parsed.pathname };
+  } catch {
+    return { url: "invalid", host: "invalid", path: "invalid" };
+  }
 }
 
 function retryDelay(response: Response, attempt: number): number {

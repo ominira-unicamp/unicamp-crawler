@@ -97,12 +97,14 @@ inalterados quando fazem parte do contrato externo da Unicamp.
 
 - `fetch/parseCatalogosIndice`: anos disponíveis.
 - `fetch/parseCatalogoProgramas`: programas de um catálogo.
+- `fetch/parseCatalogoProgramasHistoricos`: programas dos catálogos de 1998 em diante, normalizando os layouts clássico, intermediário e moderno.
 - `fetch/parseCatalogoDisciplinasIndice`: prefixos de disciplinas.
 - `fetch/parseCatalogoDisciplinasPrefixo`: disciplinas de um prefixo.
 - `fetch/parseCursoCurriculo`: blocos, modalidades, eletivas e pré-requisitos.
 - `fetch/parseCursoMembros`: unidade responsável.
+- `fetch/parseCursoInformacoes`: turno, limite de créditos e informações de programa ou especialização.
 - `fetch/parseCursoSugestao`: sugestões, semestres, créditos e disciplinas.
-- `CatalogoDisciplinasCrawler`, `CatalogoCurriculosCrawler` e `SugestaoCurriculoCrawler` agregam as respectivas árvores.
+- `CatalogoDisciplinasCrawler`, `CatalogoCurriculosCrawler`, `CatalogoInformacoesCrawler` e `SugestaoCurriculoCrawler` agregam as respectivas árvores.
 
 ### Fontes institucionais
 
@@ -121,7 +123,9 @@ unicamp-scrapper list
 unicamp-scrapper caderno-horarios --year 2026 --semester 1
 unicamp-scrapper calendario --year 2026
 unicamp-scrapper cardapio --date 2026-08-11
+unicamp-scrapper catalogos-programas --first-year 1998 --last-year 2020
 unicamp-scrapper catalogo-curriculos --first-year 2021 --last-year 2026
+unicamp-scrapper catalogo-informacoes --first-year 2021 --last-year 2026
 unicamp-scrapper curso-curriculo --program-code 34 --name "Ciência" --url <url>
 ```
 

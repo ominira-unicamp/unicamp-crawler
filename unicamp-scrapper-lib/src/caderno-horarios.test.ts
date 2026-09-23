@@ -5,6 +5,10 @@ import {
   crawlCadernoDeHorario,
   type PageFetcher,
 } from "./index.js";
+import {
+  parseCadernoDeHorarioInstituto,
+  parseCadernoDeHorarioPagina,
+} from "./caderno-horarios.js";
 
 const rootUrl =
   "https://www.dac.unicamp.br/portal/caderno-de-horarios/2026/1/S/G/";
@@ -42,9 +46,61 @@ test("crawler de caderno agrega páginas de instituto e disciplina", async () =>
 
   assert.equal(result.issues.length, 0);
   assert.equal(result.data.institutes[0].code, "IC");
+  assert.equal(result.data.institutes[0].name, "Instituto de Computação");
   assert.equal(result.data.institutes[0].courses[0].code, "MC102");
   assert.equal(
     result.data.institutes[0].courses[0].classes[0].classes[0].room,
     "IC-1",
+  );
+});
+
+test("parser de instituto usa o código como fallback quando não há nome", () => {
+  const result = parseCadernoDeHorarioInstituto(
+    "<h1>IC</h1>",
+    { year: 2026, semester: 1, instituteCode: "IC" },
+  );
+
+  assert.equal(result.name, "IC");
+});
+
+test("parser de instituto preserva o nome da página raiz", () => {
+  const result = parseCadernoDeHorarioInstituto(
+    "<h1>IC - Graduação/Tecnologia</h1>",
+    {
+      year: 2026,
+      semester: 1,
+      instituteCode: "IC",
+      name: "Instituto de Computação",
+    },
+  );
+
+  assert.equal(result.name, "Instituto de Computação");
+});
+
+test("crawler de caderno não confunde siglas de disciplinas com institutos", () => {
+  const result = parseCadernoDeHorarioPagina(
+    '<div class="lista-oferecimento">' +
+      '<div class="item"><a href="ia/">IA Instituto de Artes</a></div>' +
+      '<div class="item"><a href="ic/">IC Instituto de Computação</a></div>' +
+      '<div class="item"><a href="ia/?prefix=AC"><span>AC Instituto de Artes</span></a></div>' +
+      "</div>",
+    { year: 2026, semester: 1 },
+  );
+
+  assert.deepEqual(
+    result.institutes.map(({ instituteCode }) => instituteCode),
+    ["IA", "IC"],
+  );
+});
+
+test("crawler de caderno limita a coleta ao instituto solicitado", async () => {
+  const result = await crawlCadernoDeHorario(
+    { year: 2026, semester: 1, instituteCode: "ic" },
+    createScrapingContext(fetcher),
+  );
+
+  assert.deepEqual(
+    result.data.institutes.map((institute) => institute.code),
+    ["IC"],
   );
 });

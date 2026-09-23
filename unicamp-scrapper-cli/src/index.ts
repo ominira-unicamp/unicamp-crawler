@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
 import pino, { type Level } from "pino";
+import { trace } from "@opentelemetry/api";
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, open, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { join } from "node:path";
+import { writeHeapSnapshot } from "node:v8";
+import { DocentesProgressStore } from "./docentes-progress.js";
 import {
   cadernoDeHorarioDisciplina,
   cadernoDeHorarioInstituto,
@@ -21,7 +25,10 @@ import {
   crawlCardapios,
   crawlCatalogoCurriculos,
   crawlCatalogoDisciplinas,
+  crawlCatalogoInformacoes,
+  crawlCatalogosProgramas,
   crawlContinenciaEquivalencia,
+  crawlDocentes,
   crawlExchangeNotices,
   crawlSugestaoCurriculo,
   createCachedPageFetcher,
@@ -38,10 +45,13 @@ import {
 import { createNodePageFetcher } from "unicamp-scrapper-lib/node";
 import { SqlitePageCache } from "./cache.js";
 import { resolveCardapiosRange } from "./cardapios-range.js";
-import { createOpenObserveStream, openObserveConfig } from "./openobserve.js";
+import {
+  createScraperTelemetry,
+  shutdownScraperTelemetry,
+} from "./telemetry.js";
 
 type CommonOptions = {
-  cache: string;
+  cache?: string | false;
   refresh: boolean;
   concurrency: number;
   requestInterval: number;
@@ -49,6 +59,11 @@ type CommonOptions = {
   fetchConcurrency: number;
   output?: string;
   logDestination?: "stdout" | "stderr";
+};
+type DocentesOptions = CommonOptions & {
+  memorySnapshotEvery?: number;
+  memorySnapshotDir?: string;
+  progressDb?: string;
 };
 
 const program = new Command()
@@ -92,6 +107,7 @@ function commonOptions(command: Command): Command {
       "destino dos logs: stdout ou stderr",
     )
     .option("--cache <file>", "banco SQLite de cache", "rawhtml.db")
+    .option("--no-cache", "não lê nem grava cache SQLite")
     .option("--refresh", "rebaixa URLs e atualiza o cache")
     .addOption(
       new Option(
@@ -131,50 +147,47 @@ function logger(command: string, options: CommonOptions): ScraperLogger {
   const level = (process.env.LOG_LEVEL ??
     process.env.UNICAMP_SCRAPPER_LOG_LEVEL ??
     "info") as Level;
-  const localLogger = pino(
-    { level },
-    pino.destination(destination === "stdout" ? 1 : 2),
-  );
   const streams: pino.StreamEntry[] = [
     { level, stream: pino.destination(destination === "stdout" ? 1 : 2) },
   ];
-  const openObserve = openObserveConfig();
-  if (openObserve)
-    streams.push({
-      level,
-      stream: createOpenObserveStream(openObserve, (error) =>
-        localLogger.warn(
-          { err: error, event: "log.export.issue" },
-          "Falha ao enviar logs para OpenObserve",
-        ),
-      ),
-    });
   return pino(
     {
       level,
+      mixin: traceContext,
     },
     pino.multistream(streams),
   ).child({
     component: "unicamp-scrapper",
     command,
-    runId: randomUUID(),
+    runId: process.env.POMI_SCRAPER_RUN_ID ?? randomUUID(),
+    injectionRunId: process.env.POMI_INJECTION_RUN_ID,
   });
 }
 
-function context(options: CommonOptions, log: ScraperLogger): ScrapingContext {
-  const fetcher = createCachedPageFetcher(
-    createNodePageFetcher({
-      minIntervalMs: options.requestInterval,
-      maxConcurrent: options.fetchConcurrency,
-      retries: options.retries,
-      logger: log,
-    }),
-    new SqlitePageCache(options.cache, options.refresh),
-    { logger: log },
-  );
+function context(
+  options: CommonOptions,
+  log: ScraperLogger,
+  telemetry: ReturnType<typeof createScraperTelemetry>,
+): ScrapingContext {
+  const pageFetcher = createNodePageFetcher({
+    minIntervalMs: options.requestInterval,
+    maxConcurrent: options.fetchConcurrency,
+    retries: options.retries,
+    logger: log,
+    telemetry,
+  });
+  const fetcher =
+    options.cache === false
+      ? pageFetcher
+      : createCachedPageFetcher(
+          pageFetcher,
+          new SqlitePageCache(options.cache ?? "rawhtml.db", options.refresh),
+          { logger: log },
+        );
   return createScrapingContext(fetcher, {
     concurrency: options.concurrency,
     logger: log,
+    telemetry,
   });
 }
 
@@ -226,25 +239,59 @@ function action<Options extends CommonOptions>(
     options: Options,
     scrapingContext: ScrapingContext,
   ) => Promise<ScrapeResult<unknown>>,
+  resultEmitter: typeof emit = emit,
 ) {
   return async (options: Options, command: Command): Promise<void> => {
     const log = logger(command.name(), options);
+    const telemetry = createScraperTelemetry();
     const startedAt = Date.now();
+    const commandName = command.name();
     log.info(
-      { event: "scrape.start", options: { ...options, output: undefined } },
+      {
+        event: "scrape.start",
+        command: commandName,
+        cacheMode: options.cache === false ? "disabled" : "sqlite",
+        options: { ...options, output: undefined },
+      },
       "Scraping iniciado",
     );
     try {
-      await emit(
-        await runner(options, context(options, log)),
-        options.output,
-        log,
+      const result = await telemetry.span(
+        "scraper.run",
+        {
+          "scraper.command": commandName,
+          "scraper.cache_mode": options.cache === false ? "disabled" : "sqlite",
+        },
+        () => runner(options, context(options, log, telemetry)),
       );
+      await resultEmitter(result, options.output, log);
+      const outcome = result.issues.length > 0 ? "partial" : "success";
+      telemetry.count("scrape_runs_total", 1, {
+        command: commandName,
+        outcome,
+      });
+      telemetry.duration("scrape_run_duration_ms", Date.now() - startedAt, {
+        command: commandName,
+      });
       log.info(
-        { event: "scrape.complete", durationMs: Date.now() - startedAt },
+        {
+          event: "scrape.complete",
+          command: commandName,
+          outcome,
+          pagesTotal: result.pages.length,
+          issuesTotal: result.issues.length,
+          durationMs: Date.now() - startedAt,
+        },
         "Scraping concluído",
       );
     } catch (error) {
+      telemetry.count("scrape_runs_total", 1, {
+        command: commandName,
+        outcome: "failed",
+      });
+      telemetry.duration("scrape_run_duration_ms", Date.now() - startedAt, {
+        command: commandName,
+      });
       log.error(
         {
           event: "scrape.error",
@@ -258,6 +305,91 @@ function action<Options extends CommonOptions>(
   };
 }
 
+async function runDocentes(
+  options: DocentesOptions,
+  scrapingContext: ScrapingContext,
+): Promise<ScrapeResult<unknown>> {
+  const progress = new DocentesProgressStore(
+    options.progressDb ?? "docentes-progress.db",
+  );
+  await progress.initialize();
+  const result = await crawlDocentes(
+    {
+      progress,
+      onProgress: async ({ profiles, pages }) => {
+        const every = options.memorySnapshotEvery ?? 0;
+        if (every < 1 || profiles % every !== 0) return;
+        const memory = process.memoryUsage();
+        const directory = options.memorySnapshotDir ?? "memory-snapshots";
+        await mkdir(directory, { recursive: true });
+        const prefix = `docentes-${profiles.toString().padStart(5, "0")}`;
+        const summaryPath = join(directory, `${prefix}.memory.json`);
+        await writeFile(
+          summaryPath,
+          `${JSON.stringify({ profiles, pages, timestamp: new Date().toISOString(), memory }, null, 2)}\n`,
+          "utf8",
+        );
+        const heapPath = writeHeapSnapshot(
+          join(directory, `${prefix}.heapsnapshot`),
+        );
+        process.stderr.write(
+          `${JSON.stringify({ event: "scrape.memory_snapshot", profiles, pages, summaryPath, heapPath, memory })}\n`,
+        );
+      },
+    },
+    scrapingContext,
+  );
+  const file = options.output
+    ? await (async () => {
+        await mkdir(dirname(options.output!), { recursive: true });
+        return open(options.output!, "w");
+      })()
+    : undefined;
+  const write = (value: string) =>
+    file ? file.write(value) : (process.stdout.write(value), Promise.resolve());
+  let first = true;
+  let envelopeClosed = false;
+  await write('{"data":[\n');
+  try {
+    await progress.forEachCompleted(async (json) => {
+      if (!first) await write(",\n");
+      first = false;
+      await write(json);
+    });
+    await write(
+      `],"issues":${JSON.stringify(result.issues)},"pages":${JSON.stringify(result.pages)}}\n`,
+    );
+    envelopeClosed = true;
+    return result;
+  } finally {
+    if (!envelopeClosed) await write("]\n");
+    await file?.close();
+  }
+}
+
+async function emitDocentes(
+  result: ScrapeResult<unknown>,
+  output?: string,
+  log?: ScraperLogger,
+): Promise<void> {
+  for (const issue of result.issues)
+    if (!isIgnoredSourceIssue(issue))
+      log?.warn(
+        {
+          event: "scrape.issue",
+          adapter: issue.adapter,
+          input: issue.input,
+          code: issue.code,
+          path: issue.path,
+          expected: issue.expected,
+          actual: issue.actual,
+          err: issue.message,
+        },
+        "Issue de scraping",
+      );
+  if (result.issues.length > 0) process.exitCode = 1;
+}
+
 commonOptions(
   program
     .command("continencia-equivalencia")
@@ -268,6 +400,28 @@ commonOptions(
     crawlContinenciaEquivalencia({ url: options.url }, scrapingContext),
   ),
 );
+
+commonOptions(
+  program
+    .command("docentes")
+    .description("agrega docentes e professores seniores do Portal de Dados")
+    .option(
+      "--memory-snapshot-every <n>",
+      "grava snapshot de memória a cada N perfis; 0 desabilita",
+      nonNegativeInteger,
+      0,
+    )
+    .option(
+      "--memory-snapshot-dir <directory>",
+      "diretório dos snapshots de memória",
+      "memory-snapshots",
+    )
+    .option(
+      "--progress-db <file>",
+      "SQLite temporário de progresso dos docentes",
+      "docentes-progress.db",
+    ),
+).action(action(runDocentes, emitDocentes));
 
 commonOptions(
   program
@@ -289,11 +443,16 @@ commonOptions(
     .command("caderno-horarios")
     .description("agrega um caderno de horários")
     .requiredOption("--year <year>", "ano", year)
-    .requiredOption("--semester <semester>", "semestre", semester),
+    .requiredOption("--semester <semester>", "semestre", semester)
+    .option("--institute-code <code>", "sigla do instituto"),
 ).action(
   action((options, scrapingContext) =>
     crawlCadernoDeHorario(
-      { year: options.year, semester: options.semester },
+      {
+        year: options.year,
+        semester: options.semester,
+        instituteCode: options.instituteCode,
+      },
       scrapingContext,
     ),
   ),
@@ -451,6 +610,21 @@ function catalogRange(command: Command): Command {
 commonOptions(
   catalogRange(
     program
+      .command("catalogos-programas")
+      .description("agrega programas dos catálogos anuais, inclusive legados"),
+  ),
+).action(
+  action((options, scrapingContext) =>
+    crawlCatalogosProgramas(
+      { firstYear: options.firstYear, lastYear: options.lastYear },
+      scrapingContext,
+    ),
+  ),
+);
+
+commonOptions(
+  catalogRange(
+    program
       .command("catalogo-disciplinas")
       .description("agrega disciplinas de catálogos anuais"),
   ),
@@ -472,6 +646,21 @@ commonOptions(
 ).action(
   action((options, scrapingContext) =>
     crawlCatalogoCurriculos(
+      { firstYear: options.firstYear, lastYear: options.lastYear },
+      scrapingContext,
+    ),
+  ),
+);
+
+commonOptions(
+  catalogRange(
+    program
+      .command("catalogo-informacoes")
+      .description("agrega as seções das páginas de informações dos programas"),
+  ),
+).action(
+  action((options, scrapingContext) =>
+    crawlCatalogoInformacoes(
       { firstYear: options.firstYear, lastYear: options.lastYear },
       scrapingContext,
     ),
@@ -628,10 +817,21 @@ program
       process.stdout.write(`${command.name()}\t${command.description()}\n`);
   });
 
-program.parseAsync().catch((error: unknown) => {
-  pino({ level: process.env.UNICAMP_SCRAPPER_LOG_LEVEL ?? "info" }).error(
-    { event: "scrape.cli.error", err: error },
-    "Falha ao executar comando",
-  );
-  process.exitCode = 1;
-});
+program
+  .parseAsync()
+  .catch((error: unknown) => {
+    pino({ level: process.env.UNICAMP_SCRAPPER_LOG_LEVEL ?? "info" }).error(
+      { event: "scrape.cli.error", err: error },
+      "Falha ao executar comando",
+    );
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await shutdownScraperTelemetry();
+  });
+
+function traceContext() {
+  const spanContext = trace.getActiveSpan()?.spanContext();
+  if (!spanContext || /^0+$/.test(spanContext.traceId)) return {};
+  return { trace_id: spanContext.traceId, span_id: spanContext.spanId };
+}

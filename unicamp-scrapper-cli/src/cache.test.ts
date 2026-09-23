@@ -18,3 +18,12 @@ test("cache SQLite reutiliza páginas e refresh ignora a leitura", async () => {
   await refresh.set("https://example.test", "segunda versão");
   assert.equal(await cache.get("https://example.test"), "segunda versão");
 });
+
+test("não mantém no cache páginas HTML excepcionalmente grandes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "unicamp-scrapper-cli-"));
+  const file = join(directory, "pages.db");
+  const cache = new SqlitePageCache(file);
+
+  await cache.set("https://example.test/large", "x".repeat(10 * 1024 * 1024 + 1));
+  assert.equal(await cache.get("https://example.test/large"), undefined);
+});

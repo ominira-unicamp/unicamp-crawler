@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  catalogDirectory,
+  catalogProgramsUrl,
   parseCatalogoDisciplinasPrefixo,
   parseCatalogoProgramas,
+  parseCatalogoProgramasHistoricos,
+  parseCatalogosIndice,
+  parseCurriculoEspecializacoes,
+  parseCursoInformacoes,
   parseCursoSugestao,
+  resolveInformationSpecializations,
+  structureCursoInformacoes,
+  validateCursoInformacoes,
 } from "./catalogos.js";
 import type { ScrapeReporter } from "./core.js";
 
@@ -19,6 +28,97 @@ test("página de programas cria referências para páginas filhas", () => {
   );
   assert.equal(page.programs[0].members.url.endsWith("membros.html"), true);
   assert.equal(page.programs[0].suggestion.url.endsWith("sugestao.html"), true);
+});
+
+test("resolve diretórios históricos de 1998 e 1999", () => {
+  assert.equal(catalogDirectory(1998), "catalogo98");
+  assert.equal(catalogDirectory(1999), "catalogo99");
+  assert.equal(catalogDirectory(2000), "catalogo2000");
+  assert.equal(
+    catalogProgramsUrl(1998),
+    "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo98/cursos.html",
+  );
+});
+
+test("índice reconhece catálogos históricos com ano abreviado", () => {
+  assert.deepEqual(
+    parseCatalogosIndice(
+      '<a href="catalogo98/cursos.html">1998</a><a href="catalogo1999/cursos.html">1999</a><a href="catalogo2026/index.html">2026</a>',
+    ).years,
+    [1998, 1999, 2026],
+  );
+});
+
+test("extrai programas do catálogo clássico pela URL", () => {
+  const page = parseCatalogoProgramasHistoricos(
+    `<font>37 - <a href="cursos/cur37.html">Curso Superior de Tecnologia da Construção Civil - Noturno</a></font>
+     <font>52 - <a href="cursos/cur52.html">Ciência da Terra - Diurno</a></font>`,
+    { year: 1998 },
+  );
+
+  assert.equal(page.layout, "LEGACY_CLASSIC");
+  assert.deepEqual(page.programs, [
+    {
+      code: 37,
+      name: "Curso Superior de Tecnologia da Construção Civil",
+      shift: "NIGHT",
+      sourceUrl:
+        "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo98/cursos/cur37.html",
+    },
+    {
+      code: 52,
+      name: "Ciência da Terra",
+      shift: "DAYTIME",
+      sourceUrl:
+        "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo98/cursos/cur52.html",
+    },
+  ]);
+});
+
+test("extrai programas do catálogo intermediário e normaliza o turno", () => {
+  const page = parseCatalogoProgramasHistoricos(
+    `<span>73 </span><a href='cursos/cur73.html'>Curso Superior de Tecnologia em Saneamento Ambiental - Integral</a>
+     <span>83 </span><a href='cursos/cur83.html'>Curso Superior de Tecnologia em Construção de Edifícios - Noturno</a>`,
+    { year: 2020 },
+  );
+
+  assert.equal(page.layout, "LEGACY_INTERMEDIATE");
+  assert.deepEqual(
+    page.programs.map(({ code, name, shift }) => ({ code, name, shift })),
+    [
+      {
+        code: 73,
+        name: "Curso Superior de Tecnologia em Saneamento Ambiental",
+        shift: "DAYTIME",
+      },
+      {
+        code: 83,
+        name: "Curso Superior de Tecnologia em Construção de Edifícios",
+        shift: "NIGHT",
+      },
+    ],
+  );
+});
+
+test("registra conflito de descrição para o mesmo código histórico", () => {
+  const issues: Array<Record<string, unknown>> = [];
+  const page = parseCatalogoProgramasHistoricos(
+    `<a href="cursos/cur73.html">Controle Ambiental - Integral</a>
+     <a href="cursos/cur73.html">Saneamento Ambiental - Integral</a>`,
+    { year: 2018 },
+    {
+      info() {},
+      issue(issue) {
+        issues.push(issue);
+      },
+    },
+  );
+
+  assert.equal(page.programs.length, 1);
+  assert.deepEqual(
+    issues.map(({ code }) => code),
+    ["invalid-value"],
+  );
 });
 
 test("página de prefixo extrai disciplina e créditos", () => {
@@ -299,4 +399,242 @@ test("página de sugestão extrai semestres e disciplinas", () => {
       },
     ],
   });
+});
+
+test("página de informações preserva seções e hierarquia", () => {
+  const page = parseCursoInformacoes(
+    `<section class="main-section">
+      <div class="breadcrumbs"><li>Ignorar</li></div>
+      <h1>Curso 34 - Engenharia de Computação</h1>
+      <h2>Turno: Integral</h2>
+      <h2>O Profissional</h2>
+      <h3>AA - Sistemas de Computação</h3>
+      <div class="long-text"><p>Texto profissional.</p></div>
+      <h2>Limite de Créditos para Matrícula Semestral</h2>
+      <p>Máximo de 30 créditos por período.</p>
+    </section>`,
+    {
+      programCode: 34,
+      name: "Engenharia de Computação",
+      url: "https://example.test/cursos/34g/index.html",
+    },
+  );
+
+  assert.equal(page.pageTitle, "Curso 34 - Engenharia de Computação");
+  assert.deepEqual(
+    page.sections.map(
+      ({ level, heading, headingKey, parentHeadingKey, content }) => ({
+        level,
+        heading,
+        headingKey,
+        parentHeadingKey,
+        content,
+      }),
+    ),
+    [
+      {
+        level: 2,
+        heading: "Turno",
+        headingKey: "turno",
+        parentHeadingKey: null,
+        content: ["Integral"],
+      },
+      {
+        level: 2,
+        heading: "O Profissional",
+        headingKey: "o-profissional",
+        parentHeadingKey: null,
+        content: [],
+      },
+      {
+        level: 3,
+        heading: "AA - Sistemas de Computação",
+        headingKey: "aa-sistemas-de-computacao",
+        parentHeadingKey: "o-profissional",
+        content: ["Texto profissional."],
+      },
+      {
+        level: 2,
+        heading: "Limite de Créditos para Matrícula Semestral",
+        headingKey: "limite-de-creditos-para-matricula-semestral",
+        parentHeadingKey: null,
+        content: ["Máximo de 30 créditos por período."],
+      },
+    ],
+  );
+});
+
+test("página de informações projeta dados por variante e valida padrões", () => {
+  const page = parseCursoInformacoes(
+    `<section class="main-section">
+      <h1>Curso 34 - Engenharia de Computação</h1>
+      <h2>Turno: Integral</h2>
+      <h2>Limite de Créditos para Matrícula Semestral</h2>
+      <p>1 – Até que tenha matrícula em 30 créditos: Máximo de 30 créditos por período.</p>
+      <p>2 – A partir do período seguinte em que se tenha totalizado matrícula em 30 créditos: o máximo de créditos por período será dado pela expressão: 20 + 16,0CR.</p>
+      <h2>Integralização</h2>
+      <h3>AA - Sistemas de Computação</h3>
+      <p>Para graduar-se neste curso, o aluno deverá obter o total de 243 créditos, correspondentes a 3645 horas de atividades supervisionadas e 375 horas de atividades de extensão, que poderão ser integralizadas em 10 semestres, conforme proposta oferecida pela unidade para o cumprimento do currículo pleno, sendo o prazo máximo de integralização 16 semestres.</p>
+      <h2>O Profissional</h2>
+      <h3>AA - Sistemas de Computação</h3>
+      <p>Texto profissional.</p>
+      <h2>Reconhecimento</h2>
+      <h3>AA - Sistemas de Computação</h3>
+      <p>Reconhecido pela Portaria MEC n° 196 de 07/05/1984 e renovado pela Portaria CEE/GP n° 310 de 18/12/2020.</p>
+      <h2>Exercício Profissional</h2>
+      <p>Regulamentado por lei.</p>
+    </section>`,
+    {
+      programCode: 34,
+      name: "Engenharia de Computação",
+      url: "https://example.test/cursos/34g/index.html",
+    },
+  );
+
+  const information = structureCursoInformacoes(page);
+
+  assert.deepEqual(information, {
+    sourceUrl: "https://example.test/cursos/34g/index.html",
+    shift: "DAYTIME",
+    creditLimitType: "CR_FORMULA",
+    creditLimitFixedCredits: null,
+    creditLimitBeforeThresholdCredits: 30,
+    creditLimitThresholdCredits: 30,
+    creditLimitCrBase: 20,
+    creditLimitCrMultiplier: 16,
+    professionalPracticeDescription: "Regulamentado por lei.",
+    variants: [
+      {
+        specializationCode: "AA",
+        specializationName: "Sistemas de Computação",
+        integralizationCredits: 243,
+        integralizationSupervisedHours: 3645,
+        integralizationExtensionHours: 375,
+        integralizationSemesters: 10,
+        integralizationMaximumSemesters: 16,
+        professionalDescription: "Texto profissional.",
+        recognitionDescription:
+          "Reconhecido pela Portaria MEC n° 196 de 07/05/1984 e renovado pela Portaria CEE/GP n° 310 de 18/12/2020.",
+      },
+    ],
+  });
+  assert.deepEqual(validateCursoInformacoes(page, 2026), []);
+});
+
+test("informações clássicas usam o currículo pleno para resolver códigos", () => {
+  const input = {
+    programCode: 34,
+    name: "Engenharia de Computação",
+    url: "https://example.test/catalogo98/cursos/cur34.html",
+  };
+  const page = parseCursoInformacoes(
+    `<html><body>
+      <a href="cpl34.html">Currículo Pleno</a>
+      <center><b>Período:</b> Integral</center>
+      <p><b>O Profissional</b> Texto geral.</p>
+      <p><b>Sistemas de Computação:</b> Texto da modalidade.</p>
+      <p><b>Integralização</b> Sistemas de Computação 247 créditos, equivalentes a 3705 horas que poderão ser integralizadas em 10 semestres, sendo o prazo máximo de integralização 20 semestres.</p>
+      <p><b>Reconhecimento</b> Reconhecido pela Portaria MEC nº 244, de 11/02/94.</p>
+      <p><b>Limite de Créditos para matrícula semestral</b></p>
+      <p>1 - Até que tenha matrícula em 29 créditos: Máximo de 30 créditos por período.<br>2 - A partir do período seguinte em que se tenha totalizado matrícula em 29 créditos: o máximo de créditos por período será dado pela expressão: 20 + 24 CR.</p>
+    </body></html>`,
+    input,
+  );
+  const curriculum = parseCurriculoEspecializacoes(
+    "<p><b>AA - Sistemas de Computação</b></p>",
+    { ...input, url: page.curriculumUrl! },
+  );
+  const resolved = resolveInformationSpecializations(
+    page,
+    1998,
+    structureCursoInformacoes(page),
+    curriculum.specializations,
+  );
+
+  assert.equal(
+    page.curriculumUrl,
+    "https://example.test/catalogo98/cursos/cpl34.html",
+  );
+  assert.equal(resolved.information.creditLimitType, "CR_FORMULA");
+  assert.deepEqual(resolved.violations, []);
+  assert.deepEqual(
+    resolved.information.variants.map(
+      ({ specializationCode, specializationName, integralizationCredits }) => ({
+        specializationCode,
+        specializationName,
+        integralizationCredits,
+      }),
+    ),
+    [
+      {
+        specializationCode: "AA",
+        specializationName: "Sistemas de Computação",
+        integralizationCredits: 247,
+      },
+      {
+        specializationCode: null,
+        specializationName: null,
+        integralizationCredits: null,
+      },
+    ],
+  );
+});
+
+test("informações intermediárias separam conteúdo por habilitação", () => {
+  const page = parseCursoInformacoes(
+    `<div class="div100">
+      <h2>Turno : Integral</h2>
+      <h2>O Profissional</h2><div>Texto geral. <b>Habilitação AA - Sistemas de Computação</b>: Texto profissional.</div>
+      <h2>Integralização</h2><b>AA - Sistemas de Computação</b><br><div>Para graduar-se neste curso, o aluno deverá obter o total de 240 créditos, correspondentes a 3600 horas de atividades supervisionadas, que poderão ser integralizadas em 10 semestres, sendo o prazo máximo de integralização 16 semestres.</div>
+      <b><h2>Reconhecimento</h2></b><b>AA - Sistemas de Computação</b><br>Reconhecido pela Portaria Ministerial n° 244 de 11/02/1994.
+      <h2>Limite de Créditos para matrícula semestral</h2>Máximo de 30 créditos por Período Letivo
+    </div>`,
+    {
+      programCode: 34,
+      name: "Engenharia de Computação",
+      url: "https://example.test/catalogo2020/cursos/cur34.html",
+    },
+  );
+  const information = structureCursoInformacoes(page);
+
+  assert.equal(information.creditLimitType, "FIXED");
+  assert.deepEqual(
+    information.variants.map((variant) => [
+      variant.specializationCode,
+      variant.integralizationCredits,
+      variant.professionalDescription,
+      variant.recognitionDescription,
+    ]),
+    [
+      [
+        "AA",
+        240,
+        "Texto profissional.",
+        "Reconhecido pela Portaria Ministerial n° 244 de 11/02/1994.",
+      ],
+      [null, null, "Texto geral.", null],
+    ],
+  );
+  assert.deepEqual(validateCursoInformacoes(page, 2020), []);
+});
+
+test("validação identifica integralização com prazo zero", () => {
+  const page = parseCursoInformacoes(
+    `<h1>Curso 51 - Programa</h1>
+      <h2>Turno</h2><p>Integral</p>
+      <h2>Limite de Créditos para Matrícula Semestral</h2><p>Máximo de 30 créditos por Período Letivo</p>
+      <h2>Integralização</h2><p>Para graduar-se neste curso, o aluno deverá obter o total de 64 créditos, correspondentes a 960 horas de atividades supervisionadas, que poderão ser integralizadas em 0 semestres, conforme proposta oferecida pela unidade para o cumprimento do currículo pleno, sendo o prazo máximo de integralização 0 semestres.</p>
+      <h2>O Profissional</h2><p>Texto.</p>
+      <h2>Reconhecimento</h2><p>Processo de Reconhecimento em Tramitação.</p>`,
+    {
+      programCode: 51,
+      name: "Programa",
+      url: "https://example.test/cursos/51g/index.html",
+    },
+  );
+
+  assert.deepEqual(
+    validateCursoInformacoes(page, 2026).map(({ rule }) => rule),
+    ["integralization-positive-semesters", "integralization-positive-maximum"],
+  );
 });

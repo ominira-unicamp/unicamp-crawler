@@ -6,4 +6,5 @@ export * from "./catalogos.js";
 export * from "./continencia-equivalencia.js";
 export * from "./core.js";
 export * from "./dom.js";
+export * from "./docentes.js";
 export * from "./exchange-notices.js";
