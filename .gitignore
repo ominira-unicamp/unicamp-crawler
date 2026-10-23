@@ -1,5 +1,12 @@
 .venv
-rawhtml.db
+.local/
+*.db
+*.db.*
+*.sqlite
+*.sqlite.*
+*.csv
+/cadernoshorarios*.json
+/sugestao_curriculo*.json
 __pycache__
 *.pyc
 app.log
