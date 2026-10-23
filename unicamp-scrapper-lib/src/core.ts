@@ -47,6 +47,7 @@ export type ScrapeIssue = {
   message: string;
   expected?: string;
   actual?: unknown;
+  blocksCompleteness?: boolean;
   timestamp: string;
 };
 

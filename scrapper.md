@@ -110,7 +110,7 @@ inalterados quando fazem parte do contrato externo da Unicamp.
 
 - `fetch/parseCalendarioGraduacaoPagina` e `CalendarioCrawler` interpretam calendário, períodos, `rowspan` e `colspan`.
 - `fetch/parseCardapioPortal`, `fetch/parseCardapioDia` e `CardapioCrawler` descobrem o iframe e extraem refeições.
-- Coletores DAC legados serão reexpressos como páginas especializadas e reutilizarão páginas de catálogo quando compartilharem fonte e formato.
+- O coletor histórico descobre na própria página do curso os links de currículo pleno e sugestão, reutiliza o parser de informações legado e só completa o snapshot quando os quatro componentes são válidos.
 
 Todos os adapters de página serão públicos e executáveis isoladamente pela CLI.
 

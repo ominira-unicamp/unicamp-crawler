@@ -2,7 +2,7 @@
 import { Command, Option } from "commander";
 import pino, { type Level } from "pino";
 import { trace } from "@opentelemetry/api";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { join } from "node:path";
@@ -26,6 +26,7 @@ import {
   crawlCatalogoCurriculos,
   crawlCatalogoDisciplinas,
   crawlCatalogoInformacoes,
+  crawlCatalogProgramsSnapshot,
   crawlCatalogosProgramas,
   crawlContinenciaEquivalencia,
   crawlDocentes,
@@ -40,6 +41,7 @@ import {
   type ScrapeResult,
   type ScrapingContext,
   type ScraperLogger,
+  type CatalogProgramsSnapshotProfile,
   isIgnoredSourceIssue,
 } from "unicamp-scrapper-lib";
 import { createNodePageFetcher } from "unicamp-scrapper-lib/node";
@@ -234,12 +236,321 @@ async function emit(
   if (result.issues.length > 0) process.exitCode = 1;
 }
 
+async function emitCatalogProgramsSnapshot(
+  result: ScrapeResult<unknown>,
+  output?: string,
+  log?: ScraperLogger,
+): Promise<void> {
+  if (!output) throw new Error("catalog-programs-snapshot requer --output");
+  const snapshot = result.data as {
+    year: number;
+    profile: CatalogProgramsSnapshotProfile;
+    sourceFormat: string;
+    components: Record<string, unknown>;
+    componentStatuses: Record<string, "COMPLETE" | "UNAVAILABLE" | "FAILED">;
+  };
+  await mkdir(output, { recursive: true });
+  const components: Record<
+    string,
+    {
+      status: "COMPLETE" | "UNAVAILABLE" | "FAILED";
+      schemaVersion: number;
+      path: string | null;
+      sha256: string | null;
+      records: number;
+    }
+  > = {};
+  for (const name of new Set([
+    ...Object.keys(snapshot.components),
+    ...Object.keys(snapshot.componentStatuses),
+  ])) {
+    const status = snapshot.componentStatuses[name] ?? "FAILED";
+    const data = snapshot.components[name];
+    if (status !== "COMPLETE") {
+      components[name] = {
+        status,
+        schemaVersion: 1,
+        path: null,
+        sha256: null,
+        records: 0,
+      };
+      continue;
+    }
+    if (data === undefined) {
+      components[name] = {
+        status: "FAILED",
+        schemaVersion: 1,
+        path: null,
+        sha256: null,
+        records: 0,
+      };
+      continue;
+    }
+    const fileName = `${name}.json`;
+    const bytes = Buffer.from(
+      `${JSON.stringify({ data, issues: result.issues, pages: result.pages }, null, 2)}\n`,
+    );
+    await writeFile(join(output, fileName), bytes);
+    components[name] = {
+      status,
+      schemaVersion: 1,
+      path: fileName,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      records: componentRecords(data),
+    };
+  }
+  for (const name of ["curricula", "information", "suggestions"])
+    if (!(name in components))
+      components[name] = {
+        status: "UNAVAILABLE",
+        schemaVersion: 1,
+        path: null,
+        sha256: null,
+        records: 0,
+      };
+  const issues = result.issues.map((issue) => ({
+    ...issue,
+    severity:
+      isIgnoredSourceIssue(issue) || issue.blocksCompleteness === false
+        ? "warning"
+        : "error",
+    blocksCompleteness:
+      issue.blocksCompleteness ?? !isIgnoredSourceIssue(issue),
+  }));
+  await writeFile(
+    join(output, "issues.json"),
+    `${JSON.stringify(issues, null, 2)}\n`,
+  );
+  await writeFile(
+    join(output, "manifest.json"),
+    `${JSON.stringify(
+      {
+        protocol: "pomi.catalog-programs.snapshot",
+        version: 1,
+        snapshotId: process.env.POMI_SNAPSHOT_ID ?? randomUUID(),
+        partition: { year: snapshot.year },
+        profile: snapshot.profile,
+        producer: {
+          name: "unicamp-scrapper-cli",
+          sourceFormat: snapshot.sourceFormat,
+        },
+        createdAt: new Date().toISOString(),
+        status:
+          issues.some((issue) => issue.blocksCompleteness) ||
+          (snapshot.profile === "complete"
+            ? ["programs", "curricula", "information", "suggestions"]
+            : ["programs"]
+          ).some((name) => components[name]?.status !== "COMPLETE")
+            ? "PARTIAL"
+            : "COMPLETE",
+        components,
+        issues,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  if (issues.some((issue) => issue.blocksCompleteness)) process.exitCode = 1;
+  log?.info(
+    { output, components: Object.keys(components) },
+    "Snapshot gravado",
+  );
+}
+
+function componentRecords(value: unknown): number {
+  if (!value || typeof value !== "object") return 0;
+  const catalogs = (value as { catalogs?: unknown }).catalogs;
+  return Array.isArray(catalogs)
+    ? catalogs.reduce(
+        (total, catalog) =>
+          total +
+          (Array.isArray((catalog as { programs?: unknown }).programs)
+            ? (catalog as { programs: unknown[] }).programs.length
+            : 0),
+        0,
+      )
+    : 0;
+}
+
+function snapshotPartitionKey() {
+  const key = process.env.POMI_SNAPSHOT_PARTITION_KEY;
+  if (!key) throw new Error("POMI_SNAPSHOT_PARTITION_KEY deve ser configurada");
+  return key;
+}
+
+async function emitExchangeNoticesSnapshot(
+  result: ScrapeResult<unknown>,
+  output: string | undefined,
+  log: ScraperLogger | undefined,
+  {
+    protocol,
+    partition,
+  }: { protocol: string; partition: Record<string, string | number> },
+) {
+  const notices = Array.isArray(result.data) ? result.data : [];
+  const locations = notices.map((notice) => ({
+    place: (notice as { place?: unknown }).place,
+  }));
+  const attachments = notices.flatMap((notice) => {
+    const files = (notice as { files?: unknown }).files;
+    return Array.isArray(files)
+      ? files.map((file) => ({
+          place: (notice as { place?: unknown }).place,
+          file,
+        }))
+      : [];
+  });
+  return emitComponentsSnapshot(result, output, log, {
+    protocol,
+    partition,
+    components: { notices, locations, attachments },
+  });
+}
+
+async function emitSingleComponentSnapshot(
+  result: ScrapeResult<unknown>,
+  output: string | undefined,
+  log: ScraperLogger | undefined,
+  {
+    protocol,
+    partition,
+    component,
+  }: {
+    protocol: string;
+    partition: Record<string, string | number>;
+    component: string;
+  },
+) {
+  return emitComponentsSnapshot(result, output, log, {
+    protocol,
+    partition,
+    components: { [component]: result.data },
+  });
+}
+
+async function emitComponentsSnapshot(
+  result: ScrapeResult<unknown>,
+  output: string | undefined,
+  log: ScraperLogger | undefined,
+  {
+    protocol,
+    partition,
+    components,
+    version = 1,
+    producer,
+    records,
+    nonBlockingIssue,
+  }: {
+    protocol: string;
+    partition: Record<string, string | number>;
+    components: Record<string, unknown>;
+    version?: number;
+    producer?: Record<string, unknown>;
+    records?: Record<string, number>;
+    nonBlockingIssue?: (
+      issue: ScrapeResult<unknown>["issues"][number],
+    ) => boolean;
+  },
+) {
+  if (!output) throw new Error(`${protocol} requer --output`);
+  await mkdir(output, { recursive: true });
+  const issues = result.issues.map((issue) => ({
+    ...issue,
+    severity:
+      isIgnoredSourceIssue(issue) || issue.blocksCompleteness === false
+        ? "warning"
+        : "error",
+    blocksCompleteness:
+      issue.blocksCompleteness ??
+      (!isIgnoredSourceIssue(issue) && !nonBlockingIssue?.(issue)),
+  }));
+  const blocksCompleteness = issues.some((issue) => issue.blocksCompleteness);
+  await writeFile(
+    join(output, "issues.json"),
+    `${JSON.stringify(issues, null, 2)}\n`,
+  );
+  await writeFile(
+    join(output, "manifest.json"),
+    `${JSON.stringify(
+      {
+        protocol,
+        version,
+        snapshotId: process.env.POMI_SNAPSHOT_ID ?? randomUUID(),
+        partition,
+        producer: { name: "unicamp-scrapper-cli", ...producer },
+        createdAt: new Date().toISOString(),
+        status: blocksCompleteness ? "PARTIAL" : "COMPLETE",
+        components: Object.fromEntries(
+          await Promise.all(
+            Object.entries(components).map(async ([name, data]) => {
+              const fileName = `${name}.json`;
+              const bytes = Buffer.from(
+                `${JSON.stringify({ data, issues: result.issues, pages: result.pages }, null, 2)}\n`,
+              );
+              await writeFile(join(output, fileName), bytes);
+              return [
+                name,
+                {
+                  status: blocksCompleteness ? "FAILED" : "COMPLETE",
+                  schemaVersion: version,
+                  path: fileName,
+                  sha256: createHash("sha256").update(bytes).digest("hex"),
+                  records:
+                    records?.[name] ?? (Array.isArray(data) ? data.length : 1),
+                },
+              ];
+            }),
+          ),
+        ),
+        issues,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  if (blocksCompleteness) process.exitCode = 1;
+  log?.info(
+    { output, components: Object.keys(components) },
+    "Snapshot gravado",
+  );
+}
+
+async function emitDailyMenusSnapshot(
+  result: ScrapeResult<unknown>,
+  output: string | undefined,
+  log: ScraperLogger | undefined,
+  {
+    protocol,
+    partition,
+  }: { protocol: string; partition: Record<string, string | number> },
+) {
+  const unavailableDates = result.issues.flatMap((issue) =>
+    issue.adapter === "cardapio-dia" &&
+    issue.code === "load-error" &&
+    typeof (issue.input as { date?: unknown }).date === "string"
+      ? [(issue.input as { date: string }).date]
+      : [],
+  );
+  return emitComponentsSnapshot(result, output, log, {
+    protocol,
+    partition,
+    components: { menus: result.data, availability: { unavailableDates } },
+    nonBlockingIssue: (issue) =>
+      unavailableDates.includes((issue.input as { date?: string }).date ?? ""),
+  });
+}
+
 function action<Options extends CommonOptions>(
   runner: (
     options: Options,
     scrapingContext: ScrapingContext,
   ) => Promise<ScrapeResult<unknown>>,
-  resultEmitter: typeof emit = emit,
+  resultEmitter: (
+    result: ScrapeResult<unknown>,
+    output?: string,
+    log?: ScraperLogger,
+    options?: Options,
+  ) => Promise<void> = emit,
 ) {
   return async (options: Options, command: Command): Promise<void> => {
     const log = logger(command.name(), options);
@@ -264,7 +575,7 @@ function action<Options extends CommonOptions>(
         },
         () => runner(options, context(options, log, telemetry)),
       );
-      await resultEmitter(result, options.output, log);
+      await resultEmitter(result, options.output, log, options);
       const outcome = result.issues.length > 0 ? "partial" : "success";
       telemetry.count("scrape_runs_total", 1, {
         command: commandName,
@@ -440,6 +751,27 @@ commonOptions(
 
 commonOptions(
   program
+    .command("exchange-notices-snapshot")
+    .description("produz um snapshot versionado dos editais de intercâmbio")
+    .option("--open-url <url>", "URL explícita dos editais abertos")
+    .option("--closed-url <url>", "URL explícita dos editais fechados"),
+).action(
+  action<CommonOptions & { openUrl?: string; closedUrl?: string }>(
+    (options, scrapingContext) =>
+      crawlExchangeNotices(
+        { openUrl: options.openUrl, closedUrl: options.closedUrl },
+        scrapingContext,
+      ),
+    (result, output, log) =>
+      emitExchangeNoticesSnapshot(result, output, log, {
+        protocol: "pomi.exchange-notices.snapshot",
+        partition: { collectionKey: snapshotPartitionKey() },
+      }),
+  ),
+);
+
+commonOptions(
+  program
     .command("caderno-horarios")
     .description("agrega um caderno de horários")
     .requiredOption("--year <year>", "ano", year)
@@ -455,6 +787,39 @@ commonOptions(
       },
       scrapingContext,
     ),
+  ),
+);
+
+commonOptions(
+  program
+    .command("academic-data-snapshot")
+    .description("produz um snapshot versionado de um caderno de horários")
+    .requiredOption("--year <year>", "ano", year)
+    .requiredOption("--semester <semester>", "semestre", semester)
+    .requiredOption("--institute-code <code>", "sigla do instituto"),
+).action(
+  action<
+    CommonOptions & { year: number; semester: 1 | 2; instituteCode: string }
+  >(
+    (options, scrapingContext) =>
+      crawlCadernoDeHorario(
+        {
+          year: options.year,
+          semester: options.semester,
+          instituteCode: options.instituteCode,
+        },
+        scrapingContext,
+      ),
+    (result, output, log, options) =>
+      emitSingleComponentSnapshot(result, output, log, {
+        protocol: "pomi.academic-data.snapshot",
+        partition: {
+          year: options!.year,
+          semester: options!.semester,
+          instituteCode: options!.instituteCode,
+        },
+        component: "academicData",
+      }),
   ),
 );
 
@@ -534,6 +899,28 @@ commonOptions(
 
 commonOptions(
   program
+    .command("calendar-snapshot")
+    .description("produz um snapshot versionado do calendário de graduação")
+    .requiredOption("--year <year>", "ano", year)
+    .option("--url <url>", "URL explícita da página"),
+).action(
+  action<CommonOptions & { year: number; url?: string }>(
+    (options, scrapingContext) =>
+      crawlCalendario(
+        { year: options.year, url: options.url },
+        scrapingContext,
+      ),
+    (result, output, log, options) =>
+      emitSingleComponentSnapshot(result, output, log, {
+        protocol: "pomi.calendar.snapshot",
+        partition: { year: options!.year },
+        component: "events",
+      }),
+  ),
+);
+
+commonOptions(
+  program
     .command("calendario-graduacao-pagina")
     .description("carrega uma página de calendário")
     .requiredOption("--year <year>", "ano", year)
@@ -576,6 +963,35 @@ commonOptions(
 
 commonOptions(
   program
+    .command("daily-menus-snapshot")
+    .description("produz um snapshot versionado dos cardápios")
+    .option("--first-date <date>", "data AAAA-MM-DD")
+    .option("--last-date <date>", "data AAAA-MM-DD")
+    .option("--past-days <days>", "dias anteriores", nonNegativeInteger)
+    .option("--future-days <days>", "dias futuros", nonNegativeInteger),
+).action(
+  action<
+    CommonOptions & {
+      firstDate?: string;
+      lastDate?: string;
+      pastDays?: number;
+      futureDays?: number;
+    }
+  >(
+    (options, scrapingContext) =>
+      crawlCardapios(resolveCardapiosRange(options), scrapingContext),
+    (result, output, log) => {
+      const data = result.data as { firstDate: string; lastDate: string };
+      return emitDailyMenusSnapshot(result, output, log, {
+        protocol: "pomi.daily-menus.snapshot",
+        partition: { firstDate: data.firstDate, lastDate: data.lastDate },
+      });
+    },
+  ),
+);
+
+commonOptions(
+  program
     .command("cardapio-portal")
     .description("carrega o portal que referencia o cardápio")
     .option("--date <date>", "data AAAA-MM-DD"),
@@ -608,6 +1024,32 @@ function catalogRange(command: Command): Command {
 }
 
 commonOptions(
+  program
+    .command("catalog-programs-snapshot")
+    .description("produz um snapshot versionado dos programas de um catálogo")
+    .requiredOption("--year <year>", "ano", year)
+    .requiredOption("--profile <profile>", "core, available ou complete"),
+).action(
+  action(
+    (options, scrapingContext) =>
+      crawlCatalogProgramsSnapshot(
+        {
+          year: options.year,
+          profile: catalogSnapshotProfile(options.profile),
+        },
+        scrapingContext,
+      ),
+    emitCatalogProgramsSnapshot,
+  ),
+);
+
+function catalogSnapshotProfile(value: string): CatalogProgramsSnapshotProfile {
+  if (!(["core", "available", "complete"] as string[]).includes(value))
+    throw new Error("Perfil inválido");
+  return value as CatalogProgramsSnapshotProfile;
+}
+
+commonOptions(
   catalogRange(
     program
       .command("catalogos-programas")
@@ -636,6 +1078,82 @@ commonOptions(
     ),
   ),
 );
+
+commonOptions(
+  program
+    .command("catalog-disciplines-snapshot")
+    .description("produz um snapshot versionado das disciplinas de um catálogo")
+    .requiredOption("--year <year>", "ano", year),
+).action(
+  action<CommonOptions & { year: number }>(
+    (options, scrapingContext) =>
+      crawlCatalogoDisciplinas(
+        { firstYear: options.year, lastYear: options.year },
+        scrapingContext,
+      ),
+    (result, output, log, options) =>
+      emitComponentsSnapshot(result, output, log, {
+        protocol: "pomi.catalog-disciplines.snapshot",
+        partition: { year: options!.year },
+        version: 2,
+        producer: {
+          sourceFormat:
+            (
+              result.data as {
+                catalogs?: Array<{ sourceFormat?: string }>;
+              }
+            ).catalogs?.[0]?.sourceFormat ?? "MODERN",
+        },
+        components: catalogDisciplineSnapshotComponents(result.data),
+        records: catalogDisciplineSnapshotRecords(result.data),
+      }),
+  ),
+);
+
+function catalogDisciplineSnapshotComponents(data: unknown) {
+  const catalogs =
+    (
+      data as {
+        catalogs?: Array<{
+          year: number;
+          sourceFormat: string;
+          sourceUrl: string;
+          courses: Array<Record<string, unknown>>;
+        }>;
+      }
+    ).catalogs ?? [];
+  return {
+    catalog: {
+      catalogs: catalogs.map(({ year, sourceFormat, sourceUrl, courses }) => ({
+        year,
+        sourceFormat,
+        sourceUrl,
+        courses: courses.map(({ prerequisites: _, ...course }) => course),
+      })),
+    },
+    relationships: {
+      catalogs: catalogs.map(({ year, sourceFormat, sourceUrl, courses }) => ({
+        year,
+        sourceFormat,
+        sourceUrl,
+        courses: courses.map(({ code, prerequisites }) => ({
+          code,
+          prerequisites,
+        })),
+      })),
+    },
+  };
+}
+
+function catalogDisciplineSnapshotRecords(data: unknown) {
+  const catalogs =
+    (data as { catalogs?: Array<{ courses?: unknown[] }> }).catalogs ?? [];
+  const count = catalogs.reduce(
+    (total, catalog) => total + (catalog.courses?.length ?? 0),
+    0,
+  );
+  return { catalog: count, relationships: count };
+}
 
 commonOptions(
   catalogRange(

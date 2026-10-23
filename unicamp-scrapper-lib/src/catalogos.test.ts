@@ -2,19 +2,238 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   catalogDirectory,
+  crawlCatalogoDisciplinas,
+  crawlCatalogProgramsSnapshot,
+  parseCatalogoProgramaHistoricoDetalhes,
   catalogProgramsUrl,
   parseCatalogoDisciplinasPrefixo,
   parseCatalogoProgramas,
   parseCatalogoProgramasHistoricos,
   parseCatalogosIndice,
   parseCurriculoEspecializacoes,
+  parseCursoCurriculo,
   parseCursoInformacoes,
   parseCursoSugestao,
   resolveInformationSpecializations,
   structureCursoInformacoes,
   validateCursoInformacoes,
 } from "./catalogos.js";
-import type { ScrapeReporter } from "./core.js";
+import { createScrapingContext, type ScrapeReporter } from "./core.js";
+
+test("página histórica descobre os links de currículo e sugestão", () => {
+  const page = parseCatalogoProgramaHistoricoDetalhes(
+    `<a href="cpl34.html">Currículo Pleno</a>
+     <a href="sug34.html">Sugestões de Currículo</a>
+     <p><b>Período:</b> Integral</p>`,
+    {
+      programCode: 34,
+      name: "Engenharia de Computação",
+      url: "https://example.test/catalogo98/cursos/cur34.html",
+    },
+  );
+
+  assert.equal(
+    page.curriculum?.url,
+    "https://example.test/catalogo98/cursos/cpl34.html",
+  );
+  assert.equal(
+    page.suggestion?.url,
+    "https://example.test/catalogo98/cursos/sug34.html",
+  );
+  assert.equal(page.information.programCode, 34);
+});
+
+test("página intermediária descobre a proposta de cumprimento", () => {
+  const page = parseCatalogoProgramaHistoricoDetalhes(
+    `<a href="../curriculoPleno/cp34.html">Currículo Pleno</a>
+     <a href="../proposta/sug34.html">Proposta para Cumprimento de Currículo</a>`,
+    {
+      programCode: 34,
+      name: "Engenharia de Computação",
+      url: "https://example.test/catalogo2020/cursos/cur34.html",
+    },
+  );
+
+  assert.equal(
+    page.curriculum?.url,
+    "https://example.test/catalogo2020/curriculoPleno/cp34.html",
+  );
+  assert.equal(
+    page.suggestion?.url,
+    "https://example.test/catalogo2020/proposta/sug34.html",
+  );
+});
+
+test("crawler intermediário normaliza disciplinas de coordenadorias", async () => {
+  const indexUrl =
+    "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo2020/coordenadorias.html";
+  const pageUrl =
+    "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo2020/coordenadorias/0023.html";
+  const detailUrl =
+    "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo2020/coordenadorias/0023/0023.html";
+  const context = createScrapingContext({
+    async fetch(url) {
+      if (url === indexUrl)
+        return '<a href="coordenadorias/0023.html">Comissão de Graduação do Curso de Ciência da Computação</a>';
+      if (url === pageUrl)
+        return '<a href="../coordenadorias/0023/0023.html#MC102">MC102 - Algoritmos</a>';
+      if (url === detailUrl)
+        return `<div class="ancora"><a name="MC102">MC102 - Algoritmos</a></div>
+          <p>OF:S-1 T:004 P:000 L:002 O:000 D:000 HS:006 SL:006 C:006 AV:N EX:S FM:75%<br><strong>Pré-Req.:</strong> Não há</p>
+          <div class="justificado"><strong>Ementa:</strong> Algoritmos.</div>`;
+      throw new Error(`Página não prevista: ${url}`);
+    },
+  });
+
+  const result = await crawlCatalogoDisciplinas(
+    { firstYear: 2020, lastYear: 2020 },
+    context,
+  );
+
+  assert.deepEqual(result.issues, []);
+  assert.deepEqual(result.data.catalogs[0], {
+    year: 2020,
+    sourceFormat: "LEGACY_INTERMEDIATE",
+    sourceUrl: indexUrl,
+    courses: [
+      {
+        code: "MC102",
+        name: "Algoritmos",
+        coordinator:
+          "Comissão de Graduação do Curso de Ciência da Computação",
+        workload: {
+          theoreticalHours: 60,
+          practicalHours: 0,
+          laboratoryHours: 30,
+          guidedActivityHours: 0,
+          distanceHours: 0,
+          guidedExtensionHours: null,
+          practicalExtensionHours: null,
+          weeks: 15,
+          weeklyClassHours: 6,
+          classroomHours: 90,
+        },
+        credits: 6,
+        offeringPeriod: "ODD_PERIODS",
+        evaluation: "GRADE_AND_ATTENDANCE",
+        finalExam: true,
+        minimumAttendancePercent: 75,
+        prerequisites: { raw: "Não há", any: [] },
+        syllabus: "Algoritmos.",
+        bibliography: null,
+        sourceUrl: detailUrl,
+      },
+    ],
+  });
+});
+
+test("crawler clássico descobre páginas de ementa pelos currículos", async () => {
+  const base = "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo98";
+  const context = createScrapingContext({
+    async fetch(url) {
+      if (url === `${base}/cursos.html`)
+        return '<a href="cursos/cur34.html">34 - Computação - Integral</a>';
+      if (url === `${base}/cursos/cur34.html`)
+        return '<a href="cpl34.html">Currículo Pleno</a><a href="sug34.html">Sugestões de Currículo</a>';
+      if (url === `${base}/cursos/cpl34.html`)
+        return '<a href="../ementas/todasmc.html#mc102">MC102</a>';
+      if (url === `${base}/ementas/todasmc.html`)
+        return `<div align="right"><a name="mc102">MC102 Algoritmos</a></div>
+          <font>OF:S-5 T:004 P:000 L:002 HS:006 SL:006 C:006</font>
+          <br><font><strong>Pré-Req.:</strong> Não há</font>
+          <br><font><strong>Ementa:</strong> Algoritmos.</font>`;
+      throw new Error(`Página não prevista: ${url}`);
+    },
+  });
+
+  const result = await crawlCatalogoDisciplinas(
+    { firstYear: 1998, lastYear: 1998 },
+    context,
+  );
+
+  assert.deepEqual(result.issues, []);
+  assert.equal(result.data.catalogs[0]?.sourceFormat, "LEGACY_CLASSIC");
+  assert.deepEqual(
+    result.data.catalogs[0]?.courses.map(({ code, offeringPeriod }) => ({
+      code,
+      offeringPeriod,
+    })),
+    [{ code: "MC102", offeringPeriod: "ALL_PERIODS" }],
+  );
+});
+
+test("página histórica sem sugestão registra falha bloqueante", () => {
+  const issues: Array<Record<string, unknown>> = [];
+  const page = parseCatalogoProgramaHistoricoDetalhes(
+    '<a href="cpl34.html">Currículo Pleno</a>',
+    {
+      programCode: 34,
+      name: "Engenharia de Computação",
+      url: "https://example.test/catalogo98/cursos/cur34.html",
+    },
+    {
+      info() {},
+      issue(issue) {
+        issues.push(issue);
+      },
+    },
+  );
+
+  assert.equal(page.suggestion, null);
+  assert.deepEqual(
+    issues.map(({ code, path }) => ({ code, path })),
+    [{ code: "missing-required-section", path: "suggestion" }],
+  );
+});
+
+test("snapshot histórico complete só marca componentes completos com as quatro coletas", async () => {
+  const pages = new Map([
+    [
+      "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo2020/cursos.html",
+      '<a href="cursos/cur34.html">34 - Engenharia de Computação - Integral</a>',
+    ],
+    [
+      "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo2020/cursos/cur34.html",
+      `<a href="cpl34.html">Currículo Pleno</a>
+       <a href="sug34.html">Sugestões de Currículo</a>
+       <section class="main-section">
+         <h1>Curso 34</h1><h2>Turno</h2><p>Integral</p>
+         <h2>Limite de Créditos para Matrícula Semestral</h2><p>Máximo de 30 créditos por Período Letivo</p>
+         <h2>Integralização</h2><p>Para graduar-se neste curso, o aluno deverá obter o total de 240 créditos, correspondentes a 3600 horas de atividades supervisionadas, que poderão ser integralizadas em 10 semestres, sendo o prazo máximo de integralização 16 semestres.</p>
+         <h2>O Profissional</h2><p>Texto profissional.</p>
+         <h2>Reconhecimento</h2><p>Processo de Reconhecimento em Tramitação.</p>
+       </section>`,
+    ],
+    [
+      "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo2020/cursos/cpl34.html",
+      "<h3>Núcleo Comum</h3><table><tr><td><a>MC102</a></td></tr></table>",
+    ],
+    [
+      "https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo2020/cursos/sug34.html",
+      "<h2>AA - Padrão</h2><h3>1º Semestre - 20 créditos</h3><p><a>MC102 (6)</a></p>",
+    ],
+  ]);
+  const context = createScrapingContext({
+    async fetch(url) {
+      const page = pages.get(url);
+      if (!page) throw new Error(`Página não prevista: ${url}`);
+      return page;
+    },
+  });
+
+  const result = await crawlCatalogProgramsSnapshot(
+    { year: 2020, profile: "complete" },
+    context,
+  );
+
+  assert.deepEqual(result.data.componentStatuses, {
+    programs: "COMPLETE",
+    curricula: "COMPLETE",
+    information: "COMPLETE",
+    suggestions: "COMPLETE",
+  });
+  assert.deepEqual(result.issues, []);
+});
 
 test("página de programas cria referências para páginas filhas", () => {
   const page = parseCatalogoProgramas(
@@ -143,11 +362,11 @@ test("página de prefixo extrai disciplina e créditos", () => {
   assert.deepEqual(page.courses[0].prerequisites, {
     raw: "MC101 ou MC100+AA200",
     any: [
-      { all: [{ code: "MC101", kind: "FULL" }] },
+      { all: [{ type: "course", code: "MC101", fulfillment: "FULL" }] },
       {
         all: [
-          { code: "MC100", kind: "FULL" },
-          { code: "AA200", kind: "SPECIAL" },
+          { type: "course", code: "MC100", fulfillment: "FULL" },
+          { type: "authorization" },
         ],
       },
     ],
@@ -167,8 +386,8 @@ test("página de prefixo preserva o espaço significativo dos códigos de Físic
 
   assert.equal(page.courses[0].code, "F 328");
   assert.deepEqual(page.courses[0].prerequisites.any, [
-    { all: [{ code: "F 128", kind: "FULL" }] },
-    { all: [{ code: "MA111", kind: "FULL" }] },
+    { all: [{ type: "course", code: "F 128", fulfillment: "FULL" }] },
+    { all: [{ type: "course", code: "MA111", fulfillment: "FULL" }] },
   ]);
 });
 
@@ -321,16 +540,17 @@ test("extrai disciplina pelo markup estruturado do catálogo", () => {
       classroomHours: 90,
     },
     credits: 6,
-    offeringPeriod: "Todos os períodos",
-    evaluation: "Nota e Frequência",
+    offeringPeriod: "ALL_PERIODS",
+    evaluation: "GRADE_AND_ATTENDANCE",
     finalExam: true,
     minimumAttendancePercent: 75,
     prerequisites: {
       raw: "MC102",
-      any: [{ all: [{ code: "MC102", kind: "FULL" }] }],
+      any: [{ all: [{ type: "course", code: "MC102", fulfillment: "FULL" }] }],
     },
     syllabus: "Estruturas básicas.",
     bibliography: "Autor. Livro, 2024.",
+    sourceUrl: "https://example.test/mc",
     rawSections: [
       { heading: "Coordenadoria", text: "Comissão de Graduação" },
       {
@@ -399,6 +619,270 @@ test("página de sugestão extrai semestres e disciplinas", () => {
       },
     ],
   });
+});
+
+test("página intermediária de proposta extrai semestres em texto solto", () => {
+  const page = parseCursoSugestao(
+    `<h1>AA - Sistemas de Computação</h1>
+     01° Semestre : 28 Créditos<br>
+     <a>F 128(04)</a> <a>MC102(06)</a> 18 créditos eletivos<br><br>
+     02° Semestre : 24 Créditos<br><a>MC202(04)</a>`,
+    {
+      programCode: 34,
+      name: "Engenharia de Computação",
+      url: "https://example.test/proposta/sug34.html",
+    },
+  );
+
+  assert.deepEqual(page.suggestions, [
+    {
+      code: "AA",
+      name: "Sistemas de Computação",
+      semesters: [
+        {
+          semester: 1,
+          credits: 28,
+          electiveCredits: 18,
+          courses: [
+            { code: "F 128", credits: 4 },
+            { code: "MC102", credits: 6 },
+          ],
+        },
+        {
+          semester: 2,
+          credits: 24,
+          electiveCredits: 0,
+          courses: [{ code: "MC202", credits: 4 }],
+        },
+      ],
+    },
+  ]);
+});
+
+test("página clássica de sugestão extrai tabelas por semestre", () => {
+  const page = parseCursoSugestao(
+    `<p><b>AA - Bacharelado em Física</b></p>
+     <p><b>01º Semestre: 21 Créditos</b></p>
+     <center><table><tr><td><a>F 128</a> (04)</td><td><a>MA141</a> (04)</td></tr></table></center>
+     <p><b>02º Semestre: 22 Créditos</b></p>
+     <center><table><tr><td><a>F 218</a> (04)</td><td>ELET.(04)</td></tr></table></center>`,
+    {
+      programCode: 4,
+      name: "Física",
+      url: "https://example.test/catalogo98/cursos/sug04.html",
+    },
+  );
+
+  assert.deepEqual(page.suggestions, [
+    {
+      code: "AA",
+      name: "Bacharelado em Física",
+      semesters: [
+        {
+          semester: 1,
+          credits: 21,
+          electiveCredits: 0,
+          courses: [
+            { code: "F 128", credits: 4 },
+            { code: "MA141", credits: 4 },
+          ],
+        },
+        {
+          semester: 2,
+          credits: 22,
+          electiveCredits: 4,
+          courses: [{ code: "F 218", credits: 4 }],
+        },
+      ],
+    },
+  ]);
+});
+
+test("página clássica sem modalidade cria sugestão geral", () => {
+  const page = parseCursoSugestao(
+    `<p><b>01º Semestre: 22 Créditos</b></p>
+     <center><table><tr><td><a>MA111</a> (06)</td><td>ELET.(04)</td></tr></table></center>`,
+    {
+      programCode: 2,
+      name: "Estatística",
+      url: "https://example.test/catalogo98/cursos/sug02.html",
+    },
+  );
+
+  assert.deepEqual(page.suggestions, [
+    {
+      code: "2",
+      name: "Estatística",
+      semesters: [
+        {
+          semester: 1,
+          credits: 22,
+          electiveCredits: 4,
+          courses: [{ code: "MA111", credits: 6 }],
+        },
+      ],
+    },
+  ]);
+});
+
+test("currículo clássico extrai núcleo comum e disciplinas eletivas", () => {
+  const page = parseCursoCurriculo(
+    `<p><b>Núcleo Comum ao Curso:</b></p>
+     <table><tr><td><a>F 128</a> Física Geral I</td></tr></table>
+     <p><b>AA - Bacharelado em Física</b></p>
+     <table><tr><td><a>F 540</a> Métodos da Física Experimental I</td></tr></table>
+     <p><b>Disciplinas Eletivas</b></p><p>14 créditos dentre:</p>
+     <table><tr><td>----- Qualquer disciplina da UNICAMP</td></tr></table>`,
+    {
+      programCode: 4,
+      name: "Física",
+      url: "https://example.test/catalogo98/cursos/cpl04.html",
+    },
+  );
+
+  assert.deepEqual(page.blocks, [
+    {
+      type: "mandatory",
+      credits: null,
+      requirements: [{ type: "specific", code: "F 128" }],
+    },
+  ]);
+  assert.deepEqual(page.specializations, [
+    {
+      code: "AA",
+      name: "Bacharelado em Física",
+      blocks: [
+        {
+          type: "mandatory",
+          credits: null,
+          requirements: [{ type: "specific", code: "F 540" }],
+        },
+        {
+          type: "elective",
+          credits: 14,
+          requirements: [{ type: "any" }],
+        },
+      ],
+    },
+  ]);
+});
+
+test("currículo clássico limita o nome da especialização ao título enfatizado", () => {
+  const page = parseCursoCurriculo(
+    `<p><b>AD - Instrumento - Trompete</b><br>Além do núcleo comum, o aluno deverá cumprir:</p>
+     <table><tr><td><a>MU105</a></td></tr></table>`,
+    {
+      programCode: 22,
+      name: "Música",
+      url: "https://example.test/catalogo98/cursos/cpl22.html",
+    },
+  );
+
+  assert.equal(page.specializations[0]?.name, "Instrumento - Trompete");
+});
+
+test("currículo intermediário extrai blocos em divs", () => {
+  const page = parseCursoCurriculo(
+    `<p><strong>Núcleo Comum ao Curso:</strong></p>
+     <div class="div100"><div><a>MC102</a> Algoritmos</div></div>
+     <strong>AA - Sistemas de Computação</strong><br>
+     <strong>Além do núcleo comum, o aluno deverá cumprir:</strong><br>
+     <div class="div100"><div><a>MC202</a> Estruturas</div></div>
+     <strong>Disciplinas Eletivas</strong><br><br>13 créditos dentre:<br>
+     <div class="div100"><div><a>-----</a> Qualquer disciplina</div></div>`,
+    {
+      programCode: 34,
+      name: "Engenharia de Computação",
+      url: "https://example.test/curriculoPleno/cp34.html",
+    },
+  );
+
+  assert.deepEqual(page.blocks, [
+    {
+      type: "mandatory",
+      credits: null,
+      requirements: [{ type: "specific", code: "MC102" }],
+    },
+  ]);
+  assert.deepEqual(page.specializations, [
+    {
+      code: "AA",
+      name: "Sistemas de Computação",
+      blocks: [
+        {
+          type: "mandatory",
+          credits: null,
+          requirements: [{ type: "specific", code: "MC202" }],
+        },
+        {
+          type: "elective",
+          credits: 13,
+          requirements: [{ type: "any" }],
+        },
+      ],
+    },
+  ]);
+});
+
+test("currículo moderno não transforma prefixos em especializações e isola créditos", () => {
+  const page = parseCursoCurriculo(
+    `<h2>42 - Ciência da Computação - Currículo Pleno</h2>
+     <h3>Núcleo Comum ao Curso</h3>
+     <table><tr><td><a>MC102</a></td></tr></table>
+     <h3>Disciplinas Eletivas</h3>
+     <p>Disciplinas eletivas I: O aluno deve obter 26 créditos dentre as disciplinas listadas abaixo.</p>
+     <table><tr><td><a>-----</a></td></tr></table>
+     <p>Disciplinas eletivas II: O aluno deve obter 12 créditos dentre as disciplinas listadas abaixo.</p>
+     <table><tr><td><a>MC851</a></td></tr></table>
+     <p>Disciplinas eletivas III: O aluno deve obter 10 créditos dentre as disciplinas listadas abaixo.</p>
+     <table><tr><td><strong>EX---</strong></td><td><strong>MX---</strong></td></tr></table>`,
+    {
+      programCode: 42,
+      name: "Ciência da Computação",
+      url: "https://example.test/catalogo2026/cursos/42g/curriculo.html",
+    },
+  );
+
+  assert.deepEqual(page.specializations, []);
+  assert.deepEqual(
+    page.blocks.filter(({ type }) => type === "elective"),
+    [
+      {
+        type: "elective",
+        credits: 26,
+        requirements: [{ type: "any" }],
+      },
+      {
+        type: "elective",
+        credits: 12,
+        requirements: [{ type: "specific", code: "MC851" }],
+      },
+      {
+        type: "elective",
+        credits: 10,
+        requirements: [
+          { type: "prefix", code: "EX" },
+          { type: "prefix", code: "MX" },
+        ],
+      },
+    ],
+  );
+});
+
+test("extrator de especializações ignora requisitos por prefixo", () => {
+  const page = parseCurriculoEspecializacoes(
+    `<h2>AA - Sistemas de Computação</h2>
+     <table><tr><td><strong>EX---</strong></td><td><strong>MX---</strong></td></tr></table>`,
+    {
+      programCode: 34,
+      name: "Engenharia de Computação",
+      url: "https://example.test/catalogo2026/cursos/34g/curriculo.html",
+    },
+  );
+
+  assert.deepEqual(page.specializations, [
+    { code: "AA", name: "Sistemas de Computação" },
+  ]);
 });
 
 test("página de informações preserva seções e hierarquia", () => {
@@ -578,6 +1062,58 @@ test("informações clássicas usam o currículo pleno para resolver códigos", 
       },
     ],
   );
+});
+
+test("informações clássicas associam rótulos de bacharelado à modalidade", () => {
+  const input = {
+    programCode: 4,
+    name: "Física",
+    url: "https://example.test/catalogo98/cursos/cur04.html",
+  };
+  const page = parseCursoInformacoes(
+    `<html><body>
+      <a href="cpl04.html">Currículo Pleno</a>
+      <center><b>Período:</b> Integral</center>
+      <p><b>O Profissional</b></p>
+      <p><b>Bacharel -</b> Poderá atuar como professor universitário.</p>
+      <p><b>Integralização</b></p>
+      <p>Bacharelado em Física 176 créditos, equivalentes a 2640 horas que poderão ser integralizadas em 08 semestres, sendo o prazo máximo de integralização 12 semestres.</p>
+      <p><b>Reconhecimento</b></p>
+      <p><b>Bacharelado em Física -</b> Decreto Federal nº 072264, de 15/05/73, ratificado pela Portaria MEC nº 001790, de 22/12/93.</p>
+      <p><b>Limite de Créditos para matrícula semestral</b></p>
+      <p>1 - Até que tenha matrícula em 26 créditos: Máximo de 26 créditos por período.</p>
+      <p>2 - A partir do período seguinte em que se tenha totalizado matrícula em 26 créditos: o máximo de créditos por período será dado pela expressão: 13 + 26 CR.</p>
+    </body></html>`,
+    input,
+  );
+  const curriculum = parseCurriculoEspecializacoes(
+    "<p><b>AA - Bacharelado em Física</b></p>",
+    { ...input, url: page.curriculumUrl! },
+  );
+  const resolved = resolveInformationSpecializations(
+    page,
+    1998,
+    structureCursoInformacoes(page),
+    curriculum.specializations,
+  );
+
+  assert.deepEqual(resolved.violations, []);
+  assert.equal(resolved.information.creditLimitType, "CR_FORMULA");
+  assert.deepEqual(resolved.information.variants, [
+    {
+      specializationCode: "AA",
+      specializationName: "Bacharelado em Física",
+      integralizationCredits: 176,
+      integralizationSupervisedHours: 2640,
+      integralizationExtensionHours: null,
+      integralizationSemesters: 8,
+      integralizationMaximumSemesters: 12,
+      professionalDescription: "Poderá atuar como professor universitário.",
+      recognitionDescription:
+        "Decreto Federal nº 072264, de 15/05/73, ratificado pela Portaria MEC nº 001790, de 22/12/93.",
+    },
+  ]);
+  assert.deepEqual(validateCursoInformacoes(page, 1998), []);
 });
 
 test("informações intermediárias separam conteúdo por habilitação", () => {

@@ -16,10 +16,15 @@ test("list expõe crawlers e páginas públicas", async () => {
 
   assert.match(result.stdout, /^caderno-horarios\t/m);
   assert.match(result.stdout, /^cardapio-dia\t/m);
+  assert.match(result.stdout, /^calendar-snapshot\t/m);
+  assert.match(result.stdout, /^academic-data-snapshot\t/m);
   assert.match(result.stdout, /^catalogo-curriculos\t/m);
+  assert.match(result.stdout, /^catalog-disciplines-snapshot\t/m);
   assert.match(result.stdout, /^catalogo-informacoes\t/m);
+  assert.match(result.stdout, /^catalog-programs-snapshot\t/m);
   assert.match(result.stdout, /^continencia-equivalencia\t/m);
   assert.match(result.stdout, /^editais-intercambio\t/m);
+  assert.match(result.stdout, /^exchange-notices-snapshot\t/m);
 });
 
 test("editais-intercambio agrega as páginas abertas e fechadas", async () => {

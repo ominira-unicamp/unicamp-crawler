@@ -18,7 +18,9 @@ export const catalogDirectory = (year: number) =>
 export const catalogProgramsUrl = (year: number) =>
   `https://www.dac.unicamp.br/sistemas/catalogos/grad/${catalogDirectory(year)}/${year < 2021 ? "cursos.html" : "index.html"}`;
 const disciplinesUrl = (year: number) =>
-  `https://www.dac.unicamp.br/sistemas/catalogos/grad/catalogo${year}/disciplinas/index.html`;
+  `https://www.dac.unicamp.br/sistemas/catalogos/grad/${catalogDirectory(year)}/disciplinas/index.html`;
+const catalogCoordinatorsUrl = (year: number) =>
+  `https://www.dac.unicamp.br/sistemas/catalogos/grad/${catalogDirectory(year)}/coordenadorias.html`;
 export type CatalogosIndiceInput = { url?: string };
 export type CatalogoProgramasInput = { year: number; url?: string };
 export type CatalogosProgramasInput = {
@@ -31,6 +33,10 @@ export type CatalogoDisciplinasPrefixoInput = {
   prefix: string;
   url: string;
 };
+export type CatalogCourseOfferingPeriod =
+  "ODD_PERIODS" | "EVEN_PERIODS" | "ALL_PERIODS" | "UNIT_DISCRETION";
+export type CatalogCourseEvaluationMode =
+  "GRADE_AND_ATTENDANCE" | "ATTENDANCE" | "CONCEPT";
 export type CursoPaginaInput = {
   programCode: number;
   name: string;
@@ -64,6 +70,11 @@ export type CatalogoProgramasHistoricosPage = {
   layout: CatalogProgramLayout;
   programs: CatalogProgramReference[];
 };
+export type CatalogoProgramaHistoricoDetalhesPage = {
+  curriculum: CursoPaginaInput | null;
+  suggestion: CursoPaginaInput | null;
+  information: CursoInformacoesPage;
+};
 export type CatalogosProgramas = {
   firstYear: number;
   lastYear: number;
@@ -91,13 +102,14 @@ export type DisciplinaCatalogo = {
     classroomHours: number | null;
   };
   credits: number | null;
-  offeringPeriod: string | null;
-  evaluation: string | null;
+  offeringPeriod: CatalogCourseOfferingPeriod | null;
+  evaluation: CatalogCourseEvaluationMode | null;
   finalExam: boolean | null;
   minimumAttendancePercent: number | null;
   prerequisites: Prerequisite;
   syllabus: string | null;
   bibliography: string | null;
+  sourceUrl: string;
   rawSections?: RawDisciplineSection[];
 };
 export type CatalogoDisciplinasPrefixoPage = {
@@ -111,10 +123,19 @@ export type Prerequisite = {
   raw: string | null;
   any: Array<{ all: PrerequisiteItem[] }>;
 };
-export type PrerequisiteItem = {
-  code: string;
-  kind: "FULL" | "PARTIAL" | "SPECIAL";
-};
+export type PrerequisiteItem =
+  | {
+      type: "course";
+      code: string;
+      fulfillment: "FULL" | "PARTIAL";
+    }
+  | {
+      type: "authorization";
+    }
+  | {
+      type: "progression-coefficient";
+      minimum: number;
+    };
 export type RawDisciplineSection = {
   heading: string;
   text: string;
@@ -224,8 +245,9 @@ export type CatalogoDisciplinas = {
   lastYear: number;
   catalogs: Array<{
     year: number;
+    sourceFormat: CatalogProgramLayout;
     sourceUrl: string;
-    prefixes: Array<PrefixoReferencia & CatalogoDisciplinasPrefixoPage>;
+    courses: DisciplinaCatalogo[];
   }>;
 };
 export type CatalogoCurriculos = {
@@ -447,6 +469,62 @@ export const catalogoProgramasHistoricos: PageAdapter<
   parse: parseCatalogoProgramasHistoricos,
 };
 
+function legacyProgramLink(
+  $: ReturnType<typeof loadHtml>,
+  sourceUrl: string,
+  expression: RegExp,
+): string | null {
+  const href = $("a[href]")
+    .toArray()
+    .find((anchor) => expression.test(normalizedText($(anchor))))
+    ?.attribs?.href;
+  return href ? absoluteUrl(href, sourceUrl) : null;
+}
+
+export function parseCatalogoProgramaHistoricoDetalhes(
+  html: string,
+  input: CursoPaginaInput,
+  reporter?: ScrapeReporter,
+): CatalogoProgramaHistoricoDetalhesPage {
+  const $ = loadHtml(html);
+  const curriculumUrl = legacyProgramLink(
+    $,
+    input.url,
+    /curr[ií]culo\s+pleno/i,
+  );
+  const suggestionUrl = legacyProgramLink(
+    $,
+    input.url,
+    /(?:sugest[oõ]es?\s+de\s+curr[ií]culo|proposta\s+para\s+cumprimento\s+de\s+curr[ií]culo)/i,
+  );
+  if (!curriculumUrl)
+    reporter?.issue({
+      code: "missing-required-section",
+      path: "curriculum",
+      message: "Currículo pleno não encontrado na página histórica",
+    });
+  if (!suggestionUrl)
+    reporter?.issue({
+      code: "missing-required-section",
+      path: "suggestion",
+      message: "Sugestões de currículo não encontradas na página histórica",
+    });
+  return {
+    curriculum: curriculumUrl ? { ...input, url: curriculumUrl } : null,
+    suggestion: suggestionUrl ? { ...input, url: suggestionUrl } : null,
+    information: parseCursoInformacoes(html, input),
+  };
+}
+
+export const catalogoProgramaHistoricoDetalhes: PageAdapter<
+  CursoPaginaInput,
+  CatalogoProgramaHistoricoDetalhesPage
+> = {
+  id: "catalogo-programa-historico-detalhes",
+  fetch: fetchCursoInformacoes,
+  parse: parseCatalogoProgramaHistoricoDetalhes,
+};
+
 export async function fetchCatalogoDisciplinasIndice(
   input: CatalogoDisciplinasIndiceInput,
   context: ScrapingContext,
@@ -541,8 +619,12 @@ export function parseCatalogoDisciplinasPrefixo(
       coordinator: section("Coordenadoria"),
       workload: parsedWorkload.workload,
       credits: parsedWorkload.credits,
-      offeringPeriod: section("Período de Oferecimento"),
-      evaluation: section("Avaliação"),
+      offeringPeriod: normalizeOfferingPeriod(
+        section("Período de Oferecimento"),
+        reporter,
+        code,
+      ),
+      evaluation: normalizeEvaluation(section("Avaliação"), reporter, code),
       finalExam: booleanValue(
         section("Exame Final de Avaliação"),
         reporter,
@@ -560,6 +642,7 @@ export function parseCatalogoDisciplinasPrefixo(
       ),
       syllabus: section("Ementa"),
       bibliography: parseBibliography(section("Bibliografia")),
+      sourceUrl: input.url,
       rawSections: sections,
     });
   });
@@ -591,6 +674,65 @@ export function parseCatalogoDisciplinasPrefixo(
     title,
     courses,
   };
+}
+
+function normalizeSourceText(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeOfferingPeriod(
+  value: string | null,
+  reporter?: ScrapeReporter,
+  code?: string,
+): CatalogCourseOfferingPeriod | null {
+  if (!value) return null;
+  const normalized = normalizeSourceText(value);
+  const period = /^(?:(?:s|b)-?1|1[ºo]? periodo)/.test(normalized)
+    ? "ODD_PERIODS"
+    : /^(?:(?:s|b)-?2|2[ºo]? periodo)/.test(normalized)
+      ? "EVEN_PERIODS"
+      : /^(?:(?:s|a|b)-?5|todos os periodos)/.test(normalized)
+        ? "ALL_PERIODS"
+        : /^(?:(?:s|b)-?6|a criterio da unidade)/.test(normalized)
+          ? "UNIT_DISCRETION"
+          : null;
+  if (period) return period;
+  reporter?.issue({
+    code: "invalid-value",
+    path: code ? `disciplines.${code}.offeringPeriod` : "offeringPeriod",
+    message: "Período de oferecimento em formato inesperado",
+    actual: value,
+  });
+  return null;
+}
+
+function normalizeEvaluation(
+  value: string | null,
+  reporter?: ScrapeReporter,
+  code?: string,
+): CatalogCourseEvaluationMode | null {
+  if (!value) return null;
+  const normalized = normalizeSourceText(value);
+  const evaluation = /^(?:n|nota e frequencia)$/.test(normalized)
+    ? "GRADE_AND_ATTENDANCE"
+    : /^(?:f|frequencia)$/.test(normalized)
+      ? "ATTENDANCE"
+      : /^(?:c|conceito)$/.test(normalized)
+        ? "CONCEPT"
+        : null;
+  if (evaluation) return evaluation;
+  reporter?.issue({
+    code: "invalid-value",
+    path: code ? `disciplines.${code}.evaluation` : "evaluation",
+    message: "Modo de avaliação em formato inesperado",
+    actual: value,
+  });
+  return null;
 }
 
 type DisciplineElement = Parameters<ReturnType<typeof loadHtml>>[0];
@@ -943,7 +1085,7 @@ function parsePrerequisites(
   reporter?: ScrapeReporter,
   code?: string,
 ): Prerequisite {
-  if (!text || /n[aã]o h[aá] pré-requisitos/i.test(text))
+  if (!text || /n[aã]o h[aá](?: pré-requisitos)?\.?$/i.test(text.trim()))
     return { raw: text, any: [] };
   const any = text
     .split(/\s+ou\s+/i)
@@ -956,13 +1098,17 @@ function parsePrerequisites(
             value.replace(/^\s*\*/, "").replace(/[^A-Z0-9\s-]/gi, ""),
           );
           if (!code) return null;
+          if (code === "AA200") return { type: "authorization" };
+          const progression = /^AA4(\d{2})$/.exec(code);
+          if (progression)
+            return {
+              type: "progression-coefficient",
+              minimum: Number(progression[1]),
+            };
           return {
+            type: "course",
             code,
-            kind: partial
-              ? "PARTIAL"
-              : /^AA(?:200|4\d{2})$/.test(code)
-                ? "SPECIAL"
-                : "FULL",
+            fulfillment: partial ? "PARTIAL" : "FULL",
           };
         })
         .filter((item): item is PrerequisiteItem => item !== null),
@@ -986,8 +1132,374 @@ export const catalogoDisciplinasPrefixo: PageAdapter<
   parse: parseCatalogoDisciplinasPrefixo,
 };
 
+type LegacyDisciplineReference = {
+  url: string;
+  codes: string[];
+  names: Record<string, string>;
+  credits: Record<string, number>;
+  coordinator: string | null;
+  fallbackSourceUrl: string;
+};
+type LegacyEmentasReferencesPage = {
+  references: LegacyDisciplineReference[];
+};
+type CatalogoCoordenadoriasPage = {
+  coordinators: Array<{ url: string; coordinator: string }>;
+};
+type LegacyDisciplinasPage = { courses: DisciplinaCatalogo[] };
+type LegacySuggestionCreditsPage = {
+  courses: Array<{ code: string; credits: number }>;
+};
+
+function legacyReferenceCode(value: string) {
+  const code = canonicalCode(value.replace(/^#/, ""));
+  return /^[A-Z]{1,3}\d{3,4}$|^F \d{3,4}$/.test(code) ? code : null;
+}
+
+function mergeLegacyReferences(
+  references: LegacyDisciplineReference[],
+): LegacyDisciplineReference[] {
+  const merged = new Map<string, LegacyDisciplineReference>();
+  for (const reference of references) {
+    const key = `${reference.url}\u0000${reference.coordinator ?? ""}`;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, {
+        ...reference,
+        codes: [...new Set(reference.codes)],
+        names: { ...reference.names },
+        credits: { ...reference.credits },
+      });
+      continue;
+    }
+    existing.codes = [...new Set([...existing.codes, ...reference.codes])];
+    existing.names = { ...reference.names, ...existing.names };
+    existing.credits = { ...reference.credits, ...existing.credits };
+  }
+  return [...merged.values()].sort((left, right) =>
+    left.url.localeCompare(right.url),
+  );
+}
+
+function parseLegacyEmentasReferences(
+  html: string,
+  sourceUrl: string,
+): LegacyEmentasReferencesPage {
+  const $ = loadHtml(html);
+  const references = $("a[href]")
+    .toArray()
+    .flatMap((anchor): LegacyDisciplineReference[] => {
+      const href = $(anchor).attr("href");
+      if (!href || !/\/ementas\/todas[^#]+\.html#/i.test(href)) return [];
+      const target = new URL(absoluteUrl(href, sourceUrl));
+      const code =
+        legacyReferenceCode(decodeURIComponent(target.hash)) ??
+        legacyReferenceCode(normalizedText($(anchor)));
+      const anchorText = normalizedText($(anchor));
+      const parentText = normalizedText($(anchor).parent());
+      const name = parentText
+        .slice(parentText.indexOf(anchorText) + anchorText.length)
+        .replace(/^\s*[-–:]?\s*/, "")
+        .trim();
+      const choiceCredits = /(?:^|\s)(\d+)\s+cr[eé]ditos\s+dentre/i.exec(
+        normalizedText(
+          $(anchor).closest("table").parent().prevAll().slice(0, 4),
+        ),
+      )?.[1];
+      target.hash = "";
+      return [
+        {
+          url: target.toString(),
+          codes: code ? [code] : [],
+          names: code && name ? { [code]: name } : {},
+          credits:
+            code && choiceCredits ? { [code]: Number(choiceCredits) } : {},
+          coordinator: null,
+          fallbackSourceUrl: sourceUrl,
+        },
+      ];
+    });
+  return {
+    references: mergeLegacyReferences(references),
+  };
+}
+
+const catalogoDisciplinasClassico: PageAdapter<
+  { url: string },
+  LegacyEmentasReferencesPage
+> = {
+  id: "catalogo-disciplinas-classico",
+  fetch: (input, context) => context.fetcher.fetch(input.url),
+  parse: (html, input) => parseLegacyEmentasReferences(html, input.url),
+};
+
+const catalogoDisciplinasCreditosClassicos: PageAdapter<
+  CursoPaginaInput,
+  LegacySuggestionCreditsPage
+> = {
+  id: "catalogo-disciplinas-creditos-classicos",
+  fetch: (input, context) => context.fetcher.fetch(input.url),
+  parse: (html) => {
+    const $ = loadHtml(html);
+    return {
+      courses: $("a[href]")
+        .toArray()
+        .flatMap((anchor) => {
+          const code = legacyReferenceCode(normalizedText($(anchor)));
+          const credits = /\(\s*(\d+)\s*\)/.exec(
+            normalizedText($(anchor).parent()),
+          )?.[1];
+          return code && credits ? [{ code, credits: Number(credits) }] : [];
+        }),
+    };
+  },
+};
+
+function parseCatalogoCoordenadorias(
+  html: string,
+  sourceUrl: string,
+): CatalogoCoordenadoriasPage {
+  const $ = loadHtml(html);
+  return {
+    coordinators: $("a[href]")
+      .toArray()
+      .flatMap((anchor) => {
+        const href = $(anchor).attr("href");
+        const coordinator = normalizedText($(anchor));
+        return href && coordinator && /^coordenadorias\/\d+\.html$/i.test(href)
+          ? [{ url: absoluteUrl(href, sourceUrl), coordinator }]
+          : [];
+      }),
+  };
+}
+
+const catalogoCoordenadorias: PageAdapter<
+  { year: number; url?: string },
+  CatalogoCoordenadoriasPage
+> = {
+  id: "catalogo-coordenadorias",
+  fetch: (input, context) =>
+    context.fetcher.fetch(input.url ?? catalogCoordinatorsUrl(input.year)),
+  parse: (html, input) =>
+    parseCatalogoCoordenadorias(
+      html,
+      input.url ?? catalogCoordinatorsUrl(input.year),
+    ),
+};
+
+function parseCatalogoCoordenadoriaDisciplinas(
+  html: string,
+  sourceUrl: string,
+  coordinator: string,
+): LegacyEmentasReferencesPage {
+  const $ = loadHtml(html);
+  const references = $("a[href]")
+    .toArray()
+    .flatMap((anchor): LegacyDisciplineReference[] => {
+      const href = $(anchor).attr("href");
+      if (!href || !/\/coordenadorias\/\d+\/\d+\.html#/i.test(href))
+        return [];
+      const target = new URL(absoluteUrl(href, sourceUrl));
+      const code =
+        legacyReferenceCode(decodeURIComponent(target.hash)) ??
+        legacyReferenceCode(normalizedText($(anchor)));
+      const name = normalizedText($(anchor))
+        .replace(/^[A-Z]{1,3}\s*[A-Z]?\s*\d{3,4}\s*[-–:]?\s*/i, "")
+        .trim();
+      target.hash = "";
+      return [
+        {
+          url: target.toString(),
+          codes: code ? [code] : [],
+          names: code && name ? { [code]: name } : {},
+          credits: {},
+          coordinator,
+          fallbackSourceUrl: sourceUrl,
+        },
+      ];
+    });
+  return { references: mergeLegacyReferences(references) };
+}
+
+const catalogoCoordenadoriaDisciplinas: PageAdapter<
+  { url: string; coordinator: string },
+  LegacyEmentasReferencesPage
+> = {
+  id: "catalogo-coordenadoria-disciplinas",
+  fetch: (input, context) => context.fetcher.fetch(input.url),
+  parse: (html, input) =>
+    parseCatalogoCoordenadoriaDisciplinas(
+      html,
+      input.url,
+      input.coordinator,
+    ),
+};
+
+function legacyMetric(
+  vector: string,
+  key: string,
+  reporter: ScrapeReporter | undefined,
+  code: string,
+  required = true,
+): number | null {
+  const value = new RegExp(`(?:^|\\s)${key}:(\\d+)`, "i").exec(vector)?.[1];
+  if (value !== undefined) return Number(value);
+  if (required)
+    reporter?.issue({
+      code: "invalid-format",
+      path: `disciplines.${code}.workload`,
+      message: `Métrica ${key} ausente no vetor histórico`,
+      actual: vector,
+    });
+  return null;
+}
+
+function legacyDisciplineFragment(
+  $: ReturnType<typeof loadHtml>,
+  anchor: AnyNode,
+) {
+  const boundary = $(anchor).closest(".ancora, div[align='right']").first();
+  const start = boundary[0] ?? anchor;
+  const fragments: string[] = [];
+  let current = start.nextSibling;
+  while (current) {
+    const element = $(current);
+    if (element.is("a[name]") || element.find("a[name]").length > 0) break;
+    fragments.push($.html(current) ?? "");
+    current = current.nextSibling;
+  }
+  return loadHtml(`<div>${fragments.join("")}</div>`);
+}
+
+function legacyLabeledValue(
+  text: string,
+  label: "prerequisite" | "syllabus",
+) {
+  const expression =
+    label === "prerequisite"
+      ? /Pr[eé]-?Req\.?\s*:\s*(.*?)(?=\s+Ementa\s*:|\s+Obs\.?\s*:|\s+Voltar\b|$)/i
+      : /Ementa\s*:\s*(.*?)(?=\s+Obs\.?\s*:|\s+Voltar\b|$)/i;
+  return expression.exec(text)?.[1]?.trim() ?? "";
+}
+
+function parseLegacyDisciplinePage(
+  html: string,
+  input: {
+    url: string;
+    sourceFormat: "LEGACY_CLASSIC" | "LEGACY_INTERMEDIATE";
+    coordinator: string | null;
+  },
+  reporter?: ScrapeReporter,
+): LegacyDisciplinasPage {
+  const $ = loadHtml(html);
+  const courses: DisciplinaCatalogo[] = [];
+  $("a[name]").each((_, anchor) => {
+    const heading = normalizedText($(anchor));
+    const match =
+      /^([A-Z]{1,3}(?:\s*[A-Z])?\s*\d{3,4}|F\s*\d{3,4})\s*(?:-\s*)?(.+)$/i.exec(
+        heading,
+      );
+    if (!match) return;
+    const code = canonicalCode(match[1]);
+    if (!/^[A-Z]{1,3}\d{3,4}$|^F \d{3,4}$/.test(code)) return;
+    const fragment = legacyDisciplineFragment($, anchor);
+    const text = normalizedText(fragment.root());
+    const vector =
+      /\bOF:\s*[^\s]+(?:\s+[A-Z]{1,2}:\s*[^\s]+)+/i.exec(text)?.[0] ??
+      "";
+    if (!vector)
+      reporter?.issue({
+        code: "missing-required-section",
+        path: `disciplines.${code}.workload`,
+        message: "Vetor de carga horária histórico ausente",
+      });
+    const prerequisite = legacyLabeledValue(text, "prerequisite");
+    const syllabus = legacyLabeledValue(text, "syllabus");
+    const classic = input.sourceFormat === "LEGACY_CLASSIC";
+    const annual = /\bOF:\s*A-/i.test(vector);
+    const weeks = annual ? null : 15;
+    const weekly = legacyMetric(vector, "HS", reporter, code);
+    const classroomWeekly = legacyMetric(vector, "SL", reporter, code);
+    const total = (value: number | null) =>
+      value === null || weeks === null ? null : value * weeks;
+    courses.push({
+      code,
+      name: match[2].trim(),
+      coordinator: input.coordinator,
+      workload: {
+        theoreticalHours: total(legacyMetric(vector, "T", reporter, code)),
+        practicalHours: total(legacyMetric(vector, "P", reporter, code)),
+        laboratoryHours: total(legacyMetric(vector, "L", reporter, code)),
+        guidedActivityHours: total(
+          legacyMetric(vector, "O", reporter, code, !classic),
+        ),
+        distanceHours: total(
+          legacyMetric(vector, "D", reporter, code, !classic),
+        ),
+        guidedExtensionHours: null,
+        practicalExtensionHours: null,
+        weeks,
+        weeklyClassHours: weekly,
+        classroomHours: total(classroomWeekly),
+      },
+      credits: legacyMetric(vector, "C", reporter, code),
+      offeringPeriod: normalizeOfferingPeriod(
+        /OF:([^\s]+)/i.exec(vector)?.[1] ?? null,
+        reporter,
+        code,
+      ),
+      evaluation: normalizeEvaluation(
+        /AV:([^\s]+)/i.exec(vector)?.[1] ?? null,
+        reporter,
+        code,
+      ),
+      finalExam: (() => {
+        const value = /EX:([^\s]+)/i.exec(vector)?.[1]?.toUpperCase();
+        return value === "S" ? true : value === "N" ? false : null;
+      })(),
+      minimumAttendancePercent: percentage(
+        /FM:\s*(\d+(?:[.,]\d+)?%)/i.exec(vector)?.[1] ?? null,
+        reporter,
+        code,
+      ),
+      prerequisites: parsePrerequisites(prerequisite || null, reporter, code),
+      syllabus: syllabus || null,
+      bibliography: null,
+      sourceUrl: input.url,
+    });
+  });
+  if (!courses.length)
+    reporter?.issue({
+      code: "unrecognized-content",
+      path: "disciplines",
+      message: "Nenhuma disciplina reconhecida na página histórica",
+    });
+  return { courses };
+}
+
+const catalogoDisciplinasLegado: PageAdapter<
+  {
+    url: string;
+    sourceFormat: "LEGACY_CLASSIC" | "LEGACY_INTERMEDIATE";
+    coordinator: string | null;
+  },
+  LegacyDisciplinasPage
+> = {
+  id: "catalogo-disciplinas-legado",
+  fetch: (input, context) => context.fetcher.fetch(input.url),
+  parse: (html, input, reporter) =>
+    parseLegacyDisciplinePage(html, input, reporter),
+};
+
 function parseRequirements(table: ReturnType<typeof loadHtml>): Requisito[] {
   const requirements = new Map<string, Requisito>();
+  const add = (requirement: Requisito | undefined) => {
+    if (!requirement) return;
+    requirements.set(
+      `${requirement.type}:${requirement.code ?? ""}`,
+      requirement,
+    );
+  };
   table("a").each((_, anchor) => {
     const code = canonicalCode(normalizedText(table(anchor)));
     const requirement =
@@ -998,11 +1510,18 @@ function parseRequirements(table: ReturnType<typeof loadHtml>): Requisito[] {
           : /^(?:[A-Z]{2}\d{3}|F \d{3,4})$/.test(code)
             ? { type: "specific" as const, code }
             : undefined;
-    if (requirement)
-      requirements.set(
-        `${requirement.type}:${requirement.code ?? ""}`,
-        requirement,
-      );
+    add(requirement);
+  });
+  table("td").each((_, cell) => {
+    const value = normalizedText(table(cell));
+    const prefix = /^([A-Z]{2})\s*---/.exec(value);
+    add(
+      /^-----/.test(value)
+        ? { type: "any" }
+        : prefix
+          ? { type: "prefix", code: prefix[1] }
+          : undefined,
+    );
   });
   return [...requirements.values()];
 }
@@ -1014,11 +1533,19 @@ export async function fetchCursoCurriculo(
   return context.fetcher.fetch(input.url);
 }
 
-export function parseCursoCurriculo(
-  html: string,
-  _input: CursoPaginaInput,
+function specializationTitle(
+  value: string,
+): { code: string; name: string } | null {
+  const match = /^([A-Z]{2})\s*[-–]\s*(.+)$/i.exec(value);
+  if (!match) return null;
+  const name = match[2].replace(/\s*:\s*$/, "").trim();
+  if (!/[\p{L}\p{N}]/u.test(name)) return null;
+  return { code: match[1].toUpperCase(), name };
+}
+
+function parseModernCursoCurriculo(
+  $: ReturnType<typeof loadHtml>,
 ): CurriculoPage {
-  const $ = loadHtml(html);
   const blocks: CurriculoPage["blocks"] = [];
   const specializations = new Map<
     string,
@@ -1037,17 +1564,16 @@ export function parseCursoCurriculo(
     const value = normalizedText($(element));
     if (element.tagName === "h2") {
       kind = undefined;
-      const match = /^([A-Z]{2})\s*-\s*(.+)$/i.exec(value);
-      if (!match) {
+      const specialization = specializationTitle(value);
+      if (!specialization) {
         current = undefined;
         return;
       }
-      current = specializations.get(match[1]) ?? {
-        code: match[1],
-        name: match[2],
+      current = specializations.get(specialization.code) ?? {
+        ...specialization,
         blocks: [],
       };
-      specializations.set(match[1], current);
+      specializations.set(specialization.code, current);
       return;
     }
     if (element.tagName === "h3") {
@@ -1062,7 +1588,7 @@ export function parseCursoCurriculo(
       return;
     }
     if (element.tagName === "p" && kind === "elective") {
-      const match = /obter\s+(\d+)\s+créditos/i.exec(value);
+      const match = /obter\s+(\d+)\s+cr[eé]ditos/i.exec(value);
       electiveCredits = match ? Number(match[1]) : null;
       return;
     }
@@ -1079,6 +1605,114 @@ export function parseCursoCurriculo(
     electiveCredits = null;
   });
   return { blocks, specializations: [...specializations.values()] };
+}
+
+function parseLegacyCursoCurriculo(
+  $: ReturnType<typeof loadHtml>,
+): CurriculoPage {
+  const blocks: CurriculoPage["blocks"] = [];
+  const specializations = new Map<
+    string,
+    { code: string; name: string; blocks: CurriculoPage["blocks"] }
+  >();
+  let current:
+    | { code: string; name: string; blocks: CurriculoPage["blocks"] }
+    | undefined;
+  let kind: "mandatory" | "elective" | undefined;
+  let electiveCredits: number | null = null;
+
+  $("h3,p,strong,div.div100,table").each((_, element) => {
+    if (
+      element.tagName === "strong" &&
+      $(element).parents("table").length > 0
+    )
+      return;
+    const value = normalizedText($(element));
+    if (element.tagName === "h3") {
+      if (/opções por língua/i.test(value)) {
+        kind = "mandatory";
+        current = undefined;
+      } else if (/disciplinas eletivas/i.test(value)) kind = "elective";
+      else if (/núcleo comum|disciplinas obrigatórias/i.test(value)) {
+        kind = "mandatory";
+        current = undefined;
+      }
+      return;
+    }
+    if (element.tagName === "p" || element.tagName === "strong") {
+      const emphasized = $(element).children("strong,b").first();
+      const specialization = specializationTitle(
+        emphasized.length ? normalizedText(emphasized) : value,
+      );
+      if (specialization) {
+        current = specializations.get(specialization.code) ?? {
+          ...specialization,
+          blocks: [],
+        };
+        specializations.set(specialization.code, current);
+        kind ??= "mandatory";
+        return;
+      }
+      if (/disciplinas eletivas/i.test(value)) kind = "elective";
+      else if (/^(?:núcleo comum|disciplinas obrigatórias)/i.test(value)) {
+        kind = "mandatory";
+        current = undefined;
+      } else if (kind === "elective") {
+        const match =
+          /(?:obter\s+)?(\d+)\s+cr[eé]ditos\s+(?:eletivos|dentre)/i.exec(
+            value,
+          );
+        if (match) electiveCredits = Number(match[1]);
+      }
+      return;
+    }
+    if ((element.tagName !== "table" && element.tagName !== "div") || !kind)
+      return;
+    if (
+      element.tagName === "div" &&
+      $(element).find("div.div100").length > 0
+    )
+      return;
+    if (kind === "elective" && electiveCredits === null) {
+      const parentHtml = $(element).parent().html() ?? "";
+      const elementHtml = $(element).toString();
+      const elementIndex = parentHtml.indexOf(elementHtml);
+      const precedingText = normalizedText(
+        loadHtml(
+          elementIndex >= 0 ? parentHtml.slice(0, elementIndex) : "",
+        ).root(),
+      );
+      const match =
+        /(?:obter\s+)?(\d+)\s+cr[eé]ditos\s+(?:eletivos|dentre)/i.exec(
+          precedingText,
+        );
+      if (match) electiveCredits = Number(match[1]);
+    }
+    const table = loadHtml($(element).toString());
+    const requirements = parseRequirements(table);
+    if (!requirements.length) return;
+    const block = {
+      type: kind,
+      credits: kind === "elective" ? electiveCredits : null,
+      requirements,
+    };
+    (current?.blocks ?? blocks).push(block);
+    electiveCredits = null;
+  });
+  return { blocks, specializations: [...specializations.values()] };
+}
+
+export function parseCursoCurriculo(
+  html: string,
+  input: CursoPaginaInput,
+): CurriculoPage {
+  const $ = loadHtml(html);
+  const historicalUrl = /catalogo(?:\d{2}|20(?:0\d|1\d|20))\//i.test(
+    input.url,
+  );
+  return historicalUrl || $("div.div100").length > 0
+    ? parseLegacyCursoCurriculo($)
+    : parseModernCursoCurriculo($);
 }
 
 export const cursoCurriculo: PageAdapter<CursoPaginaInput, CurriculoPage> = {
@@ -1150,14 +1784,14 @@ export function parseCurriculoEspecializacoes(
   const $ = loadHtml(html);
   const specializations = new Map<string, { code: string; name: string }>();
   $("h1,h2,h3,b,strong").each((_, element) => {
-    const match =
-      /^(?:Habilitação\s+|Modalidade\s+)?([A-Z]{2})\s*[-–]\s*(.+)$/i.exec(
-        normalizedText($(element)),
-      );
-    if (!match) return;
-    const code = match[1].toUpperCase();
-    const name = match[2].replace(/\s*:\s*$/, "").trim();
-    if (name) specializations.set(code, { code, name });
+    if ($(element).parents("table").length > 0) return;
+    const title = specializationTitle(
+      normalizedText($(element)).replace(
+        /^(?:Habilitação|Modalidade)\s+/i,
+        "",
+      ),
+    );
+    if (title) specializations.set(title.code, title);
   });
   return {
     sourceUrl: input.url,
@@ -1263,6 +1897,23 @@ function legacyNamedEntries(
           codeMatches[index + 1]?.index ?? text.length,
         )
         .replace(/^\s*:\s*/, "")
+        .trim(),
+    }));
+
+  const dashedMatches = [
+    ...text.matchAll(
+      /(?:^|\s)([A-ZÀ-Ú][^.:]{1,80}?)\s*[-–]\s*(?=(?:Poderá|Poder[aá]|Terá|Ter[aá]|Decreto|Portaria|Reconhecido|Não haverá))/gi,
+    ),
+  ];
+  if (dashedMatches.length > 0)
+    return dashedMatches.map((match, index) => ({
+      code: null,
+      name: match[1].trim(),
+      content: text
+        .slice(
+          match.index! + match[0].length,
+          dashedMatches[index + 1]?.index ?? text.length,
+        )
         .trim(),
     }));
 
@@ -1447,9 +2098,9 @@ function parseLegacyCursoInformacoes(
         .map((match) => ({ code: null, name: match[1].trim() }))
         .filter((entry) => plausibleLegacySpecializationName(entry.name));
       const entries = legacyNamedEntries(content, [
-        ...(knownVariants.length > 0
-          ? knownVariants
-          : [...candidateNames, ...inferredNames]),
+        ...knownVariants,
+        ...candidateNames,
+        ...inferredNames,
         ...(/Para Matrícula Antes da Opção/i.test(content)
           ? [{ code: "AX", name: "Para Matrícula Antes da Opção" }]
           : []),
@@ -1832,9 +2483,50 @@ function normalizedSpecializationName(value: string): string {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/^(?:habilitacao|modalidade|enfase)\s+/i, "")
+    .replace(/\bbacharelado\b/i, "bacharel")
     .replace(/[^a-z0-9]+/gi, " ")
     .trim()
     .toLowerCase();
+}
+
+function specializationLookupKeys(
+  value: string,
+  programName: string,
+): string[] {
+  const normalized = normalizedSpecializationName(value);
+  const keys = [normalized];
+  if (normalized === "bacharel")
+    keys.push(normalizedSpecializationName(`Bacharelado em ${programName}`));
+  if (normalized === "licenciado")
+    keys.push(normalizedSpecializationName(`Licenciatura em ${programName}`));
+  return [...new Set(keys)];
+}
+
+function mergeVariantInformation(
+  left: CatalogProgramVariantInformation | undefined,
+  right: CatalogProgramVariantInformation,
+): CatalogProgramVariantInformation {
+  if (!left) return right;
+  return {
+    specializationCode: right.specializationCode ?? left.specializationCode,
+    specializationName: right.specializationName ?? left.specializationName,
+    integralizationCredits:
+      right.integralizationCredits ?? left.integralizationCredits,
+    integralizationSupervisedHours:
+      right.integralizationSupervisedHours ??
+      left.integralizationSupervisedHours,
+    integralizationExtensionHours:
+      right.integralizationExtensionHours ?? left.integralizationExtensionHours,
+    integralizationSemesters:
+      right.integralizationSemesters ?? left.integralizationSemesters,
+    integralizationMaximumSemesters:
+      right.integralizationMaximumSemesters ??
+      left.integralizationMaximumSemesters,
+    professionalDescription:
+      right.professionalDescription ?? left.professionalDescription,
+    recognitionDescription:
+      right.recognitionDescription ?? left.recognitionDescription,
+  };
 }
 
 export function resolveInformationSpecializations(
@@ -1854,15 +2546,22 @@ export function resolveInformationSpecializations(
     byName.set(key, values);
   }
   const violations: CatalogoInformacoesValidationViolation[] = [];
-  const variants: CatalogProgramVariantInformation[] = [];
+  const variants = new Map<string, CatalogProgramVariantInformation>();
   for (const variant of information.variants) {
     if (variant.specializationCode || !variant.specializationName) {
-      variants.push(variant);
+      const key = variant.specializationCode
+        ? `code:${variant.specializationCode}`
+        : "program";
+      variants.set(key, mergeVariantInformation(variants.get(key), variant));
       continue;
     }
-    const matches =
-      byName.get(normalizedSpecializationName(variant.specializationName)) ??
-      [];
+    const matches = [
+      ...new Map(
+        specializationLookupKeys(variant.specializationName, page.programName)
+          .flatMap((key) => byName.get(key) ?? [])
+          .map((value) => [value.code, value]),
+      ).values(),
+    ];
     if (matches.length !== 1) {
       violations.push(
         validationViolation(
@@ -1878,13 +2577,18 @@ export function resolveInformationSpecializations(
       );
       continue;
     }
-    variants.push({
+    const resolved = {
       ...variant,
       specializationCode: matches[0].code,
       specializationName: matches[0].name,
-    });
+    };
+    const key = `code:${resolved.specializationCode}`;
+    variants.set(key, mergeVariantInformation(variants.get(key), resolved));
   }
-  return { information: { ...information, variants }, violations };
+  return {
+    information: { ...information, variants: [...variants.values()] },
+    violations,
+  };
 }
 
 function validationViolation(
@@ -1922,16 +2626,29 @@ function compatibleVariantTargets(left: string[], right: string[]): boolean {
   const rightSpecializations = right.filter((value) => value !== "PROGRAM");
   if (leftSpecializations.length === 0 || rightSpecializations.length === 0)
     return true;
-  const leftSet = new Set(leftSpecializations);
-  const rightSet = new Set(rightSpecializations);
+  const equivalent = (first: string, second: string) => {
+    const leftName = normalizedSpecializationName(first);
+    const rightName = normalizedSpecializationName(second);
+    return (
+      leftName === rightName ||
+      (leftName === "bacharel" && rightName.startsWith("bacharel ")) ||
+      (rightName === "bacharel" && leftName.startsWith("bacharel ")) ||
+      (leftName === "licenciado" && rightName.startsWith("licenciatura ")) ||
+      (rightName === "licenciado" && leftName.startsWith("licenciatura "))
+    );
+  };
   return (
-    leftSpecializations.every((value) => rightSet.has(value)) ||
-    rightSpecializations.every((value) => leftSet.has(value))
+    leftSpecializations.every((value) =>
+      rightSpecializations.some((other) => equivalent(value, other)),
+    ) ||
+    rightSpecializations.every((value) =>
+      leftSpecializations.some((other) => equivalent(value, other)),
+    )
   );
 }
 
 function recognizedText(text: string): boolean {
-  return /^Reconhecido (?:pelo|pela) (?:Decreto Federal|Portaria CEE\/GP|Portaria MEC|Portaria Ministerial).*?\d{2}\/\d{2}\/\d{2,4}.*(?:\.)?$/i.test(
+  return /^(?:Reconhecido (?:pelo|pela) |Decreto Federal|Portaria (?:CEE\/GP|MEC|Ministerial)).*?\d{2}\/\d{2}\/\d{2,4}.*(?:\.)?$/i.test(
     text,
   );
 }
@@ -2087,15 +2804,100 @@ export async function fetchCursoSugestao(
 
 export function parseCursoSugestao(
   html: string,
-  _input: CursoPaginaInput,
+  input: CursoPaginaInput,
 ): SugestaoPage {
   const $ = loadHtml(html);
   const suggestions: SugestaoPage["suggestions"] = [];
-  const semesterTitle = /^(\d+)[º°o.]?\s+Semestre\s*-\s*(\d+)\s+cr[eé]ditos$/i;
+  const semesterTitle =
+    /^(\d+)[º°o.]?\s+Semestre\s*(?:-|:)\s*(\d+)\s+cr[eé]ditos$/i;
   const courseTitle = /^([A-Z]{1,3}\s*[A-Z]?\s*\d{3,4}\*?)\s*\((\d+)\)$/i;
   const electiveCredits = /(\d+)\s+cr[eé]ditos\s+eletivos/i;
 
-  $("h2").each((_, heading) => {
+  const intermediateSuggestions = [
+    ...html.matchAll(/<h1\b[^>]*>([\s\S]*?)<\/h1>([\s\S]*?)(?=<h1\b|$)/gi),
+  ].flatMap((match) => {
+    const title = normalizedText(loadHtml(match[1]).root());
+    const suggestion = suggestionTitle.exec(title);
+    if (!suggestion?.groups) return [];
+    const semesters = [
+      ...match[2].matchAll(
+        /(\d+)[º°o.]?\s*Semestre\s*:\s*(\d+)\s+cr[eé]ditos([\s\S]*?)(?=(?:\d+)[º°o.]?\s*Semestre\s*:|$)/gi,
+      ),
+    ].map((semester) => {
+      const fragment = loadHtml(semester[3]);
+      const text = normalizedText(fragment.root());
+      const elective = electiveCredits.exec(text);
+      const courses = fragment("a")
+        .toArray()
+        .flatMap((anchor) => {
+          const course = courseTitle.exec(normalizedText(fragment(anchor)));
+          return course
+            ? [{ code: canonicalCode(course[1]), credits: Number(course[2]) }]
+            : [];
+        });
+      return {
+        semester: Number(semester[1]),
+        credits: Number(semester[2]),
+        electiveCredits: elective ? Number(elective[1]) : 0,
+        courses,
+      };
+    });
+    return semesters.length
+      ? [
+          {
+            code: canonicalCode(suggestion.groups.code),
+            name: suggestion.groups.name.trim(),
+            semesters,
+          },
+        ]
+      : [];
+  });
+  if (intermediateSuggestions.length)
+    return { suggestions: intermediateSuggestions };
+
+  const semesterFromHeading = (element: AnyNode) => {
+    const semester = semesterTitle.exec(normalizedText($(element)));
+    if (!semester) return null;
+    const content = $(element)
+      .nextAll()
+      .toArray()
+      .find((next) => {
+        const nextValue = normalizedText($(next));
+        if (semesterTitle.test(nextValue) || suggestionTitle.test(nextValue))
+          return false;
+        return (
+          next.tagName === "p" ||
+          next.tagName === "table" ||
+          $(next).find("table").length > 0
+        );
+      });
+    if (!content) return null;
+    const container = $(content).find("table").first().length
+      ? $(content).find("table").first()
+      : $(content);
+    const courseElements = container.find("td").length
+      ? container.find("td").toArray()
+      : container.find("a").toArray();
+    const courses = courseElements.flatMap((courseElement) => {
+      const course = courseTitle.exec(normalizedText($(courseElement)));
+      return course
+        ? [{ code: canonicalCode(course[1]), credits: Number(course[2]) }]
+        : [];
+    });
+    const text = normalizedText(container);
+    const elective = electiveCredits.exec(text);
+    const legacyElective = [
+      ...text.matchAll(/ELET\.?\s*\(?\s*(\d+)\s*\)?/gi),
+    ].reduce((total, match) => total + Number(match[1]), 0);
+    return {
+      semester: Number(semester[1]),
+      credits: Number(semester[2]),
+      electiveCredits: elective ? Number(elective[1]) : legacyElective,
+      courses,
+    };
+  };
+
+  $("h2,p").each((_, heading) => {
     const title = normalizedText($(heading));
     const suggestion = suggestionTitle.exec(title);
     if (!suggestion?.groups) return;
@@ -2103,28 +2905,11 @@ export function parseCursoSugestao(
     $(heading)
       .nextAll()
       .each((__, element) => {
-        if (element.tagName === "h2") return false;
-        if (element.tagName !== "h3") return;
-        const semester = semesterTitle.exec(normalizedText($(element)));
-        if (!semester) return;
-        const paragraph = $(element).nextAll("p").first();
-        if (!paragraph.length) return;
-        const courses = paragraph
-          .find("a")
-          .toArray()
-          .flatMap((anchor) => {
-            const course = courseTitle.exec(normalizedText($(anchor)));
-            return course
-              ? [{ code: canonicalCode(course[1]), credits: Number(course[2]) }]
-              : [];
-          });
-        const elective = electiveCredits.exec(normalizedText(paragraph));
-        semesters.push({
-          semester: Number(semester[1]),
-          credits: Number(semester[2]),
-          electiveCredits: elective ? Number(elective[1]) : 0,
-          courses,
-        });
+        const value = normalizedText($(element));
+        if (suggestionTitle.test(value)) return false;
+        if (element.tagName !== "h3" && element.tagName !== "p") return;
+        const semester = semesterFromHeading(element);
+        if (semester) semesters.push(semester);
       });
     if (semesters.length)
       suggestions.push({
@@ -2133,6 +2918,20 @@ export function parseCursoSugestao(
         semesters,
       });
   });
+  if (suggestions.length === 0) {
+    const semesters = $("h3,p")
+      .toArray()
+      .flatMap((element) => {
+        const semester = semesterFromHeading(element);
+        return semester ? [semester] : [];
+      });
+    if (semesters.length)
+      suggestions.push({
+        code: String(input.programCode),
+        name: input.name,
+        semesters,
+      });
+  }
   return { suggestions };
 }
 
@@ -2151,6 +2950,9 @@ export async function crawlCatalogoDisciplinas(
     (_, offset) => input.firstYear + offset,
   );
   const catalogs = await context.map(years, async (year) => {
+    if (year <= 2011) return crawlCatalogoDisciplinasClassico(year, context);
+    if (year <= 2020)
+      return crawlCatalogoDisciplinasIntermediario(year, context);
     const index = await context.tryLoad(catalogoDisciplinasIndice, { year });
     if (!index) return undefined;
     const prefixes = await context.map(index.data.prefixes, async (prefix) =>
@@ -2158,19 +2960,12 @@ export async function crawlCatalogoDisciplinas(
     );
     return {
       year,
+      sourceFormat: "MODERN" as const,
       sourceUrl: disciplinesUrl(year),
-      prefixes: prefixes.flatMap((page) =>
-        page
-          ? [
-              {
-                ...(page.metadata.input as PrefixoReferencia),
-                ...page.data,
-                courses: page.data.courses.map(
-                  ({ rawSections: _, ...course }) => course,
-                ),
-              },
-            ]
-          : [],
+      courses: uniqueCatalogCourses(
+        prefixes.flatMap((page) => page?.data.courses ?? []),
+        context,
+        year,
       ),
     };
   });
@@ -2182,6 +2977,326 @@ export async function crawlCatalogoDisciplinas(
     },
     issues: context.issues,
     pages: context.pages,
+  };
+}
+
+function crawlerIssue(
+  context: ScrapingContext,
+  adapter: string,
+  input: unknown,
+  issue: Omit<
+    ScrapeResult<unknown>["issues"][number],
+    "adapter" | "input" | "timestamp"
+  >,
+) {
+  context.issues.push({
+    ...issue,
+    adapter,
+    input,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+function comparableCatalogCourse(course: DisciplinaCatalogo) {
+  const { sourceUrl: _, ...comparable } = course;
+  return comparable;
+}
+
+function uniqueCatalogCourses(
+  courses: DisciplinaCatalogo[],
+  context: ScrapingContext,
+  year: number,
+): DisciplinaCatalogo[] {
+  const unique = new Map<string, DisciplinaCatalogo>();
+  for (const course of [...courses].sort((left, right) =>
+    left.sourceUrl.localeCompare(right.sourceUrl),
+  )) {
+    const existing = unique.get(course.code);
+    if (!existing) {
+      unique.set(course.code, course);
+      continue;
+    }
+    if (
+      JSON.stringify(comparableCatalogCourse(existing)) !==
+      JSON.stringify(comparableCatalogCourse(course))
+    )
+      crawlerIssue(
+        context,
+        "catalogo-disciplinas-cobertura",
+        { year, code: course.code },
+        {
+          code: "invalid-value",
+          path: `disciplines.${course.code}`,
+          message: "Mesmo código possui dados divergentes no catálogo",
+          expected: JSON.stringify(comparableCatalogCourse(existing)),
+          actual: comparableCatalogCourse(course),
+        },
+      );
+  }
+  return [...unique.values()].sort((left, right) =>
+    left.code.localeCompare(right.code),
+  );
+}
+
+function validateLegacyCoverage(
+  year: number,
+  references: LegacyDisciplineReference[],
+  courses: DisciplinaCatalogo[],
+  context: ScrapingContext,
+) {
+  const parsedCodes = new Set(courses.map(({ code }) => code));
+  const expectedCodes = new Set(references.flatMap(({ codes }) => codes));
+  if (expectedCodes.size === 0)
+    crawlerIssue(
+      context,
+      "catalogo-disciplinas-cobertura",
+      { year },
+      {
+        code: "missing-required-section",
+        path: "disciplines.references",
+        message: "Nenhuma referência de disciplina encontrada no catálogo",
+      },
+    );
+  if (courses.length === 0)
+    crawlerIssue(
+      context,
+      "catalogo-disciplinas-cobertura",
+      { year },
+      {
+        code: "unrecognized-content",
+        path: "disciplines",
+        message: "Nenhuma disciplina coletada no catálogo",
+      },
+    );
+  for (const code of expectedCodes)
+    if (!parsedCodes.has(code))
+      crawlerIssue(
+        context,
+        "catalogo-disciplinas-cobertura",
+        { year, code },
+        {
+          code: "missing-required-section",
+          path: `disciplines.${code}`,
+          message: "Disciplina referenciada não foi coletada",
+        },
+      );
+  for (const reference of references) {
+    if (!reference.codes.every((code) => parsedCodes.has(code))) continue;
+    for (const issue of context.issues)
+      if (
+        issue.adapter === "catalogo-disciplinas-legado" &&
+        (issue.input as { url?: unknown })?.url === reference.url &&
+        (issue.code === "load-error" || issue.code === "unrecognized-content")
+      )
+        issue.blocksCompleteness = false;
+  }
+}
+
+function legacyFallbackCourses(
+  references: LegacyDisciplineReference[],
+  collected: DisciplinaCatalogo[],
+  creditsByCode: Map<string, number>,
+) {
+  const collectedCodes = new Set(collected.map(({ code }) => code));
+  return references.flatMap((reference) =>
+    reference.codes.flatMap((code): DisciplinaCatalogo[] => {
+      if (collectedCodes.has(code)) return [];
+      const name = reference.names[code];
+      const credits = creditsByCode.get(code) ?? reference.credits[code];
+      if (!name || credits === undefined) return [];
+      collectedCodes.add(code);
+      return [
+        {
+          code,
+          name,
+          coordinator: reference.coordinator,
+          workload: {
+            theoreticalHours: null,
+            practicalHours: null,
+            laboratoryHours: null,
+            guidedActivityHours: null,
+            distanceHours: null,
+            guidedExtensionHours: null,
+            practicalExtensionHours: null,
+            weeks: null,
+            weeklyClassHours: null,
+            classroomHours: null,
+          },
+          credits,
+          offeringPeriod: null,
+          evaluation: null,
+          finalExam: null,
+          minimumAttendancePercent: null,
+          prerequisites: { raw: null, any: [] },
+          syllabus: null,
+          bibliography: null,
+          sourceUrl: reference.fallbackSourceUrl,
+        },
+      ];
+    }),
+  );
+}
+
+async function crawlCatalogoDisciplinasClassico(
+  year: number,
+  context: ScrapingContext,
+) {
+  const programs = await context.tryLoad(catalogoProgramasHistoricos, { year });
+  if (!programs) return undefined;
+  const details = await context.map(programs.data.programs, async (program) =>
+    context.tryLoad(catalogoProgramaHistoricoDetalhes, {
+      programCode: program.code,
+      name: program.name,
+      url: program.sourceUrl,
+    }),
+  );
+  for (const detail of details) {
+    if (!detail) continue;
+    const inputUrl = (detail.metadata.input as { url: string }).url;
+    const hasNoIntegralization = normalizeSourceText(
+      JSON.stringify(detail.data.information.sections),
+    ).includes("nao havera integralizacao");
+    for (const issue of context.issues)
+      if (
+        issue.adapter === "catalogo-programa-historico-detalhes" &&
+        (issue.input as { url?: unknown })?.url === inputUrl &&
+        (issue.path === "suggestion" ||
+          (issue.path === "curriculum" && hasNoIntegralization))
+      )
+        issue.blocksCompleteness = false;
+  }
+  const referenceSources = details.flatMap((detail) => [
+    ...(detail?.data.curriculum
+      ? [{ ...detail.data.curriculum, kind: "curriculum" as const }]
+      : []),
+    ...(detail?.data.suggestion
+      ? [{ ...detail.data.suggestion, kind: "suggestion" as const }]
+      : []),
+  ]);
+  const references = await context.map(referenceSources, async (source) => ({
+    source,
+    page: await context.tryLoad(catalogoDisciplinasClassico, {
+      url: source.url,
+    }),
+  }));
+  const loadedSuggestionUrls = new Set(
+    references.flatMap(({ source, page }) =>
+      source.kind === "suggestion" && page ? [source.url] : [],
+    ),
+  );
+  for (const detail of details) {
+    const curriculumUrl = detail?.data.curriculum?.url;
+    const suggestionUrl = detail?.data.suggestion?.url;
+    if (!curriculumUrl || !suggestionUrl || !loadedSuggestionUrls.has(suggestionUrl))
+      continue;
+    for (const issue of context.issues)
+      if (
+        issue.adapter === "catalogo-disciplinas-classico" &&
+        (issue.input as { url?: unknown })?.url === curriculumUrl &&
+        issue.code === "load-error"
+      )
+        issue.blocksCompleteness = false;
+  }
+  const disciplineReferences = mergeLegacyReferences(
+    references.flatMap(
+      ({ page }) => page?.data.references ?? [],
+    ),
+  );
+  const pages = await context.map(disciplineReferences, async (reference) =>
+    context.tryLoad(catalogoDisciplinasLegado, {
+      url: reference.url,
+      sourceFormat: "LEGACY_CLASSIC",
+      coordinator: null,
+    }),
+  );
+  const collected = pages.flatMap((page) => page?.data.courses ?? []);
+  const collectedCodes = new Set(collected.map(({ code }) => code));
+  const needsFallback = disciplineReferences.some((reference) =>
+    reference.codes.some((code) => !collectedCodes.has(code)),
+  );
+  const suggestionInputs = needsFallback
+    ? details.flatMap((detail) =>
+        detail?.data.suggestion ? [detail.data.suggestion] : [],
+      )
+    : [];
+  const suggestions = await context.map(suggestionInputs, (suggestion) =>
+    context.tryLoad(catalogoDisciplinasCreditosClassicos, suggestion),
+  );
+  const creditsByCode = new Map<string, number>();
+  for (const suggestion of suggestions)
+    for (const course of suggestion?.data.courses ?? []) {
+          const code = canonicalCode(course.code);
+          const existing = creditsByCode.get(code);
+          if (existing !== undefined && existing !== course.credits)
+            crawlerIssue(
+              context,
+              "catalogo-disciplinas-cobertura",
+              { year, code },
+              {
+                code: "invalid-value",
+                path: `disciplines.${code}.credits`,
+                message: "Mesmo código possui créditos divergentes no catálogo",
+                expected: String(existing),
+                actual: course.credits,
+              },
+            );
+          else creditsByCode.set(code, course.credits);
+    }
+  const courses = uniqueCatalogCourses(
+    [
+      ...collected,
+      ...legacyFallbackCourses(
+        disciplineReferences,
+        collected,
+        creditsByCode,
+      ),
+    ],
+    context,
+    year,
+  );
+  validateLegacyCoverage(year, disciplineReferences, courses, context);
+  return {
+    year,
+    sourceFormat: "LEGACY_CLASSIC" as const,
+    sourceUrl: catalogProgramsUrl(year),
+    courses,
+  };
+}
+
+async function crawlCatalogoDisciplinasIntermediario(
+  year: number,
+  context: ScrapingContext,
+) {
+  const index = await context.tryLoad(catalogoCoordenadorias, { year });
+  if (!index) return undefined;
+  const coordinatorIndexes = await context.map(
+    index.data.coordinators,
+    async (coordinator) =>
+      context.tryLoad(catalogoCoordenadoriaDisciplinas, coordinator),
+  );
+  const disciplineReferences = mergeLegacyReferences(
+    coordinatorIndexes.flatMap(
+      (coordinator) => coordinator?.data.references ?? [],
+    ),
+  );
+  const pages = await context.map(disciplineReferences, async (reference) =>
+    context.tryLoad(catalogoDisciplinasLegado, {
+      url: reference.url,
+      sourceFormat: "LEGACY_INTERMEDIATE",
+      coordinator: reference.coordinator,
+    }),
+  );
+  const courses = uniqueCatalogCourses(
+    pages.flatMap((page) => page?.data.courses ?? []),
+    context,
+    year,
+  );
+  validateLegacyCoverage(year, disciplineReferences, courses, context);
+  return {
+    year,
+    sourceFormat: "LEGACY_INTERMEDIATE" as const,
+    sourceUrl: catalogCoordinatorsUrl(year),
+    courses,
   };
 }
 
@@ -2453,6 +3568,333 @@ export async function crawlSugestaoCurriculo(
       firstYear: input.firstYear,
       lastYear: input.lastYear,
       catalogs: catalogs.flatMap((catalog) => (catalog ? [catalog] : [])),
+    },
+    issues: context.issues,
+    pages: context.pages,
+  };
+}
+
+export type CatalogProgramsSnapshotProfile = "core" | "available" | "complete";
+
+export type CatalogProgramsSnapshot = {
+  year: number;
+  profile: CatalogProgramsSnapshotProfile;
+  sourceFormat: CatalogProgramLayout;
+  components: {
+    programs: CatalogosProgramas;
+    curricula?: CatalogoCurriculos;
+    information?: CatalogoInformacoes;
+    suggestions?: SugestaoCurriculo;
+  };
+  componentStatuses: Record<
+    "programs" | "curricula" | "information" | "suggestions",
+    "COMPLETE" | "UNAVAILABLE" | "FAILED"
+  >;
+};
+
+const snapshotComponentNames = [
+  "programs",
+  "curricula",
+  "information",
+  "suggestions",
+] as const;
+
+type SnapshotComponentName = (typeof snapshotComponentNames)[number];
+
+function catalogProgramReference(
+  program: CatalogProgramReference,
+  curriculum: CursoPaginaInput,
+  suggestion: CursoPaginaInput,
+): CursoReferencia {
+  return {
+    code: program.code,
+    name: program.name,
+    slug: String(program.code),
+    curriculum,
+    members: { ...curriculum },
+    suggestion,
+  };
+}
+
+function completeComponent(
+  expectedPrograms: CatalogProgramReference[],
+  programs: Array<{ code: number }>,
+  issuesBefore: number,
+  context: ScrapingContext,
+): "COMPLETE" | "FAILED" {
+  const actual = new Set(programs.map((program) => program.code));
+  return context.issues
+    .slice(issuesBefore)
+    .every((issue) => issue.blocksCompleteness === false) &&
+    expectedPrograms.every((program) => actual.has(program.code))
+    ? "COMPLETE"
+    : "FAILED";
+}
+
+async function crawlHistoricalCatalogProgramsSnapshot(
+  year: number,
+  programs: CatalogosProgramas,
+  context: ScrapingContext,
+): Promise<Pick<CatalogProgramsSnapshot, "components" | "componentStatuses">> {
+  const catalog = programs.catalogs.find((value) => value.year === year);
+  const statuses: CatalogProgramsSnapshot["componentStatuses"] = {
+    programs: catalog && catalog.programs.length > 0 ? "COMPLETE" : "FAILED",
+    curricula: "UNAVAILABLE",
+    information: "UNAVAILABLE",
+    suggestions: "UNAVAILABLE",
+  };
+  if (!catalog)
+    return { components: { programs }, componentStatuses: statuses };
+
+  const detailsBefore = context.issues.length;
+  const details = await context.map(catalog.programs, async (program) =>
+    context.tryLoad(catalogoProgramaHistoricoDetalhes, {
+      programCode: program.code,
+      name: program.name,
+      url: program.sourceUrl,
+    }),
+  );
+  const loaded = details.flatMap((detail, index) =>
+    detail ? [{ program: catalog.programs[index], detail: detail.data }] : [],
+  );
+  if (
+    loaded.length !== catalog.programs.length ||
+    context.issues.length !== detailsBefore
+  ) {
+    statuses.curricula = "FAILED";
+    statuses.information = "FAILED";
+    statuses.suggestions = "FAILED";
+    return { components: { programs }, componentStatuses: statuses };
+  }
+
+  const curriculaBefore = context.issues.length;
+  const curricula = await context.map(loaded, async ({ program, detail }) => {
+    if (!detail.curriculum) return undefined;
+    const page = await context.tryLoad(cursoCurriculo, detail.curriculum);
+    if (!page) return undefined;
+    return {
+      ...catalogProgramReference(
+        program,
+        detail.curriculum,
+        detail.suggestion ?? detail.curriculum,
+      ),
+      ...page.data,
+    };
+  });
+  const curriculumPrograms = curricula.flatMap((program) =>
+    program ? [program] : [],
+  );
+  for (const program of curriculumPrograms)
+    if (
+      program.blocks.length === 0 &&
+      program.specializations.every(
+        (specialization) => specialization.blocks.length === 0,
+      )
+    )
+      context.issues.push({
+        adapter: "curso-curriculo",
+        input: { year, programCode: program.code },
+        code: "missing-required-section",
+        path: "blocks",
+        message: "Currículo histórico sem blocos reconhecidos",
+        timestamp: new Date().toISOString(),
+      });
+  statuses.curricula = completeComponent(
+    catalog.programs,
+    curriculumPrograms,
+    curriculaBefore,
+    context,
+  );
+
+  const informationBefore = context.issues.length;
+  const informationPrograms = await context.map(
+    loaded,
+    async ({ program, detail }) => {
+      const parsedInformation = structureCursoInformacoes(detail.information);
+      const curriculum = detail.information.curriculumUrl
+        ? await context.tryLoad(curriculoEspecializacoes, {
+            programCode: program.code,
+            name: program.name,
+            url: detail.information.curriculumUrl,
+          })
+        : undefined;
+      const resolved = resolveInformationSpecializations(
+        detail.information,
+        year,
+        parsedInformation,
+        curriculum?.data.specializations ?? [],
+      );
+      for (const violation of [
+        ...validateCursoInformacoes(detail.information, year),
+        ...resolved.violations,
+      ])
+        context.issues.push({
+          adapter: "catalogo-informacoes",
+          input: { year, programCode: program.code },
+          code: "invalid-value",
+          path: violation.rule,
+          message: violation.message,
+          actual: violation.actual,
+          blocksCompleteness: year <= 2020 ? false : undefined,
+          timestamp: new Date().toISOString(),
+        });
+      return {
+        code: program.code,
+        name: program.name,
+        sourceUrl: detail.information.sourceUrl,
+        sections: detail.information.sections,
+        information: resolved.information,
+      };
+    },
+  );
+  statuses.information = completeComponent(
+    catalog.programs,
+    informationPrograms,
+    informationBefore,
+    context,
+  );
+
+  const suggestionsBefore = context.issues.length;
+  const suggestions = await context.map(loaded, async ({ program, detail }) => {
+    if (!detail.suggestion) return undefined;
+    const page = await context.tryLoad(cursoSugestao, detail.suggestion);
+    if (!page || page.data.suggestions.length === 0) {
+      if (page && page.data.suggestions.length === 0)
+        context.issues.push({
+          adapter: "curso-sugestao",
+          input: detail.suggestion,
+          code: "missing-required-section",
+          path: "suggestions",
+          message: "Sugestões de currículo vazias na página histórica",
+          timestamp: new Date().toISOString(),
+        });
+      return undefined;
+    }
+    return {
+      ...catalogProgramReference(
+        program,
+        detail.curriculum ?? detail.suggestion,
+        detail.suggestion,
+      ),
+      ...page.data,
+    };
+  });
+  const suggestionPrograms = suggestions.flatMap((program) =>
+    program ? [program] : [],
+  );
+  statuses.suggestions = completeComponent(
+    catalog.programs,
+    suggestionPrograms,
+    suggestionsBefore,
+    context,
+  );
+
+  return {
+    components: {
+      programs,
+      curricula: {
+        catalogs: [
+          {
+            year,
+            sourceUrl: catalog.sourceUrl,
+            programs: curriculumPrograms,
+          },
+        ],
+      },
+      information: {
+        catalogs: [
+          {
+            year,
+            sourceUrl: catalog.sourceUrl,
+            programs: informationPrograms,
+          },
+        ],
+        validation: buildCatalogoInformacoesValidation([
+          {
+            year,
+            sourceUrl: catalog.sourceUrl,
+            programs: informationPrograms,
+            violations: [],
+          },
+        ]),
+      },
+      suggestions: {
+        source: catalogsPortalUrl,
+        firstYear: year,
+        lastYear: year,
+        catalogs: [
+          {
+            year,
+            sourceUrl: catalog.sourceUrl,
+            programs: suggestionPrograms,
+          },
+        ],
+      },
+    },
+    componentStatuses: statuses,
+  };
+}
+
+export async function crawlCatalogProgramsSnapshot(
+  input: { year: number; profile: CatalogProgramsSnapshotProfile },
+  context: ScrapingContext,
+): Promise<ScrapeResult<CatalogProgramsSnapshot>> {
+  const programs = await crawlCatalogosProgramas(
+    { firstYear: input.year, lastYear: input.year },
+    context,
+  );
+  const components: CatalogProgramsSnapshot["components"] = {
+    programs: programs.data,
+  };
+  const componentStatuses: CatalogProgramsSnapshot["componentStatuses"] = {
+    programs:
+      programs.data.catalogs.length === 1 &&
+      programs.data.catalogs[0].programs.length > 0
+        ? "COMPLETE"
+        : "FAILED",
+    curricula: "UNAVAILABLE",
+    information: "UNAVAILABLE",
+    suggestions: "UNAVAILABLE",
+  };
+  if (input.year < 2021 && input.profile === "complete") {
+    const historical = await crawlHistoricalCatalogProgramsSnapshot(
+      input.year,
+      programs.data,
+      context,
+    );
+    Object.assign(components, historical.components);
+    Object.assign(componentStatuses, historical.componentStatuses);
+  }
+  if (input.year >= 2021 && input.profile !== "core") {
+    components.curricula = (
+      await crawlCatalogoCurriculos(
+        { firstYear: input.year, lastYear: input.year },
+        context,
+      )
+    ).data;
+    components.information = (
+      await crawlCatalogoInformacoes(
+        { firstYear: input.year, lastYear: input.year },
+        context,
+      )
+    ).data;
+    components.suggestions = (
+      await crawlSugestaoCurriculo(
+        { firstYear: input.year, lastYear: input.year },
+        context,
+      )
+    ).data;
+    componentStatuses.curricula = "COMPLETE";
+    componentStatuses.information = "COMPLETE";
+    componentStatuses.suggestions = "COMPLETE";
+  }
+  return {
+    data: {
+      year: input.year,
+      profile: input.profile,
+      sourceFormat: catalogProgramLayout(input.year),
+      components,
+      componentStatuses,
     },
     issues: context.issues,
     pages: context.pages,
