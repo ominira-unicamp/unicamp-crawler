@@ -1174,3 +1174,20 @@ test("validação identifica integralização com prazo zero", () => {
     ["integralization-positive-semesters", "integralization-positive-maximum"],
   );
 });
+
+for (const text of [
+  "Não há",
+  "Não há.",
+  "Não há pré-requisitos",
+  "Não há pré-requisitos para essa disciplina",
+  "Não há pré-requisitos para essa disciplina.",
+  "NAO HA PRE-REQUISITOS PARA ESSA DISCIPLINA",
+]) {
+  test(`preserva ausência explícita de pré-requisitos: ${text}`, () => {
+    const page = parseCatalogoDisciplinasPrefixo(
+      `<h2 id="disc-ac001">AC001 - Atividade</h2><h3>Pré-requisitos</h3><p>${text}</p>`,
+      { year: 2027, prefix: "AC", url: "https://example.test/ac" },
+    );
+    assert.deepEqual(page.courses[0].prerequisites, { raw: text, any: [] });
+  });
+}

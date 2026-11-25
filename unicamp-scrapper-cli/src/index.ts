@@ -415,16 +415,19 @@ async function emitSingleComponentSnapshot(
     protocol,
     partition,
     component,
+    version = 1,
   }: {
     protocol: string;
     partition: Record<string, string | number>;
     component: string;
+    version?: number;
   },
 ) {
   return emitComponentsSnapshot(result, output, log, {
     protocol,
     partition,
     components: { [component]: result.data },
+    version,
   });
 }
 
@@ -813,6 +816,7 @@ commonOptions(
     (result, output, log, options) =>
       emitSingleComponentSnapshot(result, output, log, {
         protocol: "pomi.academic-data.snapshot",
+        version: 2,
         partition: {
           year: options!.year,
           semester: options!.semester,

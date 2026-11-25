@@ -1085,7 +1085,12 @@ function parsePrerequisites(
   reporter?: ScrapeReporter,
   code?: string,
 ): Prerequisite {
-  if (!text || /n[aã]o h[aá](?: pré-requisitos)?\.?$/i.test(text.trim()))
+  if (
+    !text ||
+    /^nao ha(?: pre-requisitos(?: para essa disciplina)?)?\.?$/.test(
+      normalizeSourceText(text),
+    )
+  )
     return { raw: text, any: [] };
   const any = text
     .split(/\s+ou\s+/i)

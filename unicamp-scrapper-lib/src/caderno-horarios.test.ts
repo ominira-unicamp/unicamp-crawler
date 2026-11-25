@@ -6,6 +6,7 @@ import {
   type PageFetcher,
 } from "./index.js";
 import {
+  parseCadernoDeHorarioDisciplina,
   parseCadernoDeHorarioInstituto,
   parseCadernoDeHorarioPagina,
 } from "./caderno-horarios.js";
@@ -26,7 +27,7 @@ const pages = new Map([
   ],
   [
     courseUrl,
-    '<h1>MC102 - Algoritmos</h1><div class="panel"><span class="label">A</span><ul class="docentes"><li>Ada Lovelace</li></ul><ul class="horariosFormatado"><li><span class="diaSemana">Segunda</span><span class="horarios">08:00 - 10:00</span><span class="salaAula">IC-1</span></li></ul><ul class="reservas"><li>10 - vagas</li></ul></div>',
+    '<h1>MC102 - Algoritmos</h1><p><b class="prop">Créditos:</b> <span class="label">4</span></p><div class="panel"><span class="label">A</span><ul class="docentes"><li>Ada Lovelace</li></ul><ul class="horariosFormatado"><li><span class="diaSemana">Segunda</span><span class="horarios">08:00 - 10:00</span><span class="salaAula">IC-1</span></li></ul><ul class="reservas"><li>10 - vagas</li></ul></div>',
   ],
 ]);
 
@@ -55,10 +56,11 @@ test("crawler de caderno agrega páginas de instituto e disciplina", async () =>
 });
 
 test("parser de instituto usa o código como fallback quando não há nome", () => {
-  const result = parseCadernoDeHorarioInstituto(
-    "<h1>IC</h1>",
-    { year: 2026, semester: 1, instituteCode: "IC" },
-  );
+  const result = parseCadernoDeHorarioInstituto("<h1>IC</h1>", {
+    year: 2026,
+    semester: 1,
+    instituteCode: "IC",
+  });
 
   assert.equal(result.name, "IC");
 });
@@ -103,4 +105,60 @@ test("crawler de caderno limita a coleta ao instituto solicitado", async () => {
     result.data.institutes.map((institute) => institute.code),
     ["IC"],
   );
+});
+
+const disciplineInput = {
+  year: 2027,
+  semester: 1 as const,
+  courseCode: "EX092",
+  url: courseUrl,
+};
+const creditsHtml = (value: string) =>
+  `<p><b class="prop">Créditos:</b> <span class="label label-primary">${value}</span></p>`;
+
+test("extrai créditos pelo rótulo, incluindo dois, quatro e zero", () => {
+  for (const credits of [0, 2, 4]) {
+    const parsed = parseCadernoDeHorarioDisciplina(
+      `<h1>EX092 - Brinquedos e Brincadeiras</h1>${creditsHtml(String(credits))}<div class="panel"><span class="label">A</span></div>`,
+      disciplineInput,
+    );
+    assert.equal(parsed.credits, credits);
+  }
+});
+
+test("rejeita créditos ausentes, decimais, negativos, inválidos e conflitantes", () => {
+  for (const html of [
+    "",
+    creditsHtml(""),
+    creditsHtml("2.5"),
+    creditsHtml("-1"),
+    creditsHtml("dois"),
+    creditsHtml("2147483648"),
+    creditsHtml("2") + creditsHtml("4"),
+  ]) {
+    assert.throws(
+      () =>
+        parseCadernoDeHorarioDisciplina(
+          `<h1>EX092 - Nome</h1>${html}`,
+          disciplineInput,
+        ),
+      /Créditos/,
+    );
+  }
+});
+
+test("falha de créditos gera issue bloqueante no crawler", async () => {
+  const result = await crawlCadernoDeHorario(
+    { year: 2026, semester: 1 },
+    createScrapingContext({
+      async fetch(url) {
+        return url === courseUrl
+          ? "<h1>MC102 - Nome</h1>"
+          : await fetcher.fetch(url);
+      },
+    }),
+  );
+  assert.equal(result.issues.length, 1);
+  assert.equal(result.issues[0].code, "load-error");
+  assert.equal(result.data.institutes[0].courses.length, 0);
 });

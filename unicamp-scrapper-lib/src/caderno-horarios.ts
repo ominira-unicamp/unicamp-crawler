@@ -29,7 +29,12 @@ export type Turma = {
   classes: Aula[];
   reservations: number[];
 };
-export type Disciplina = { code: string; name: string; classes: Turma[] };
+export type Disciplina = {
+  code: string;
+  name: string;
+  credits: number;
+  classes: Turma[];
+};
 export type CadernoDeHorarioInstitutoPage = {
   code: string;
   name: string;
@@ -115,7 +120,8 @@ export function parseCadernoDeHorarioInstituto(
   const $ = loadHtml(html);
   const heading = normalizedText($("h1").first());
   const [, headingName] = heading.split(/\s*[-–—]\s*/, 2);
-  const name = input.name?.trim() || headingName?.trim() || heading || input.instituteCode;
+  const name =
+    input.name?.trim() || headingName?.trim() || heading || input.instituteCode;
   const courses: CadernoDeHorarioDisciplinaInput[] = [];
   $(".disciplina a[href]").each((_, anchor) => {
     const href = $(anchor).attr("href");
@@ -155,6 +161,29 @@ export function parseCadernoDeHorarioDisciplina(
   const heading = normalizedText($("h1").first()).split("-");
   const code = heading[0]?.trim() || input.courseCode;
   const name = heading.slice(1).join("-").trim();
+  const creditValues = $("b.prop")
+    .toArray()
+    .filter(
+      (label) =>
+        normalizedText($(label))
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toLowerCase() === "creditos:",
+    )
+    .map((label) =>
+      normalizedText($(label).parent().find("span.label").first()),
+    );
+  if (
+    creditValues.length === 0 ||
+    creditValues.some((value) => !/^\d+$/.test(value)) ||
+    new Set(creditValues).size !== 1
+  )
+    throw new Error(
+      `Créditos ausentes, inválidos ou conflitantes para ${code}`,
+    );
+  const credits = Number(creditValues[0]);
+  if (!Number.isSafeInteger(credits) || credits > 2147483647)
+    throw new Error(`Créditos inválidos para ${code}`);
   const classes = $(".panel")
     .toArray()
     .map((panel) => ({
@@ -185,7 +214,7 @@ export function parseCadernoDeHorarioDisciplina(
         .map((item) => Number(normalizedText($(item)).split("-")[0]))
         .filter(Number.isFinite),
     }));
-  return { code, name, classes };
+  return { code, name, credits, classes };
 }
 export const cadernoDeHorarioDisciplina: PageAdapter<
   CadernoDeHorarioDisciplinaInput,
