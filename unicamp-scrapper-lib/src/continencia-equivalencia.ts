@@ -19,12 +19,19 @@ export type ContinenciaEquivalenciaInitialInput = {
   url: string;
 };
 
+export type CourseRelationMember = {
+  code: string;
+  prerequisiteOnlyMarker: boolean;
+};
+
 export type CourseRelationGroup = {
-  sourceCodes: string[];
+  members: CourseRelationMember[];
+  rawText: string;
 };
 
 export type CourseRelation = {
   targetCode: string;
+  sourceUrls: string[];
   groups: CourseRelationGroup[];
 };
 
@@ -41,6 +48,12 @@ export type ContinenciaEquivalenciaInitialPage = {
 
 export type ContinenciaEquivalenciaData = {
   sourceUrl: string;
+  coverage: {
+    expectedInitials: string[];
+    loadedInitials: string[];
+    failedInitials: string[];
+    complete: boolean;
+  };
   relations: CourseRelation[];
 };
 
@@ -60,11 +73,12 @@ export function parseContinenciaEquivalenciaIndex(
   const sourceUrl = input.url ?? continenciaEquivalenciaUrl;
   const initials = new Map<string, ContinenciaEquivalenciaInitialInput>();
 
-  $("#iniciais a[href]").each((_, anchor) => {
+  $("#iniciais a").each((_, anchor) => {
     const initial = normalizedText($(anchor));
     const href = $(anchor).attr("href");
     if (!/^[A-Z]$/i.test(initial) || !href) {
       reporter?.issue({
+        blocksCompleteness: true,
         code: "invalid-format",
         path: "initials",
         message: "Inicial de continência em formato inesperado",
@@ -73,14 +87,37 @@ export function parseContinenciaEquivalenciaIndex(
       });
       return;
     }
-    initials.set(initial.toUpperCase(), {
-      initial: initial.toUpperCase(),
-      url: absoluteUrl(href, sourceUrl),
-    });
+    let url: string;
+    try {
+      url = absoluteUrl(href, sourceUrl);
+      if (!/^https?:$/.test(new URL(url).protocol)) throw new Error();
+    } catch {
+      reporter?.issue({
+        blocksCompleteness: true,
+        code: "invalid-format",
+        path: "initials",
+        message: "URL de inicial inválida",
+        actual: href,
+      });
+      return;
+    }
+    const key = initial.toUpperCase();
+    if (initials.has(key) && initials.get(key)?.url !== url) {
+      reporter?.issue({
+        blocksCompleteness: true,
+        code: "invalid-value",
+        path: "initials",
+        message: "URLs divergentes para a mesma inicial",
+        actual: { initial, url },
+      });
+      return;
+    }
+    initials.set(key, { initial: key, url });
   });
 
   if (initials.size === 0)
     reporter?.issue({
+      blocksCompleteness: true,
       code: "unrecognized-content",
       path: "initials",
       message: "Nenhuma inicial de continência foi encontrada",
@@ -115,13 +152,21 @@ export function parseContinenciaEquivalenciaInitial(
   const relations: CourseRelation[] = [];
 
   $(".row").each((index, row) => {
-    const target = $(row).find(".disciplina a[name]").first();
-    if (!target.length) return;
+    const discipline = $(row)
+      .find(".disciplina")
+      .filter((_, node) => $(node).closest(".row")[0] === row)
+      .first();
+    const content = $(row)
+      .find(".continencia")
+      .filter((_, node) => $(node).closest(".row")[0] === row)
+      .first();
+    if (!discipline.length && !content.length) return;
+    const target = discipline.find("a[name]").first();
 
     const targetCode = canonicalCode(normalizedText(target));
-    const content = $(row).find(".continencia").first();
-    if (!targetCode) {
+    if (!validCourseCode(targetCode)) {
       reporter?.issue({
+        blocksCompleteness: true,
         code: "invalid-format",
         path: `relations[${index}].targetCode`,
         message: "Código da disciplina-alvo não encontrado",
@@ -130,6 +175,7 @@ export function parseContinenciaEquivalenciaInitial(
     }
     if (!content.length) {
       reporter?.issue({
+        blocksCompleteness: true,
         code: "missing-required-section",
         path: `relations.${targetCode}.groups`,
         message: "Relações da disciplina não encontradas",
@@ -138,20 +184,27 @@ export function parseContinenciaEquivalenciaInitial(
       return;
     }
 
-    const groups = relationGroups($, content);
+    const groups = relationGroups(
+      $,
+      content,
+      reporter,
+      `relations.${targetCode}.groups`,
+    );
     if (groups.length === 0) {
       reporter?.issue({
+        blocksCompleteness: true,
         code: "unrecognized-content",
         path: `relations.${targetCode}.groups`,
         message: "Nenhuma relação de disciplina foi reconhecida",
       });
       return;
     }
-    relations.push({ targetCode, groups });
+    relations.push({ targetCode, sourceUrls: [input.url], groups });
   });
 
   if (relations.length === 0)
     reporter?.issue({
+      blocksCompleteness: true,
       code: "unrecognized-content",
       path: "relations",
       message: "Nenhuma relação de continência foi encontrada",
@@ -161,30 +214,137 @@ export function parseContinenciaEquivalenciaInitial(
   return { initial: input.initial, sourceUrl: input.url, relations };
 }
 
+function validCourseCode(code: string): boolean {
+  return /^(?:[A-Z]{1,3}\d{3,4}|F \d{3,4})$/.test(code);
+}
+
+type RelationToken = {
+  raw: string;
+  member?: CourseRelationMember;
+};
+
 function relationGroups(
   $: ReturnType<typeof loadHtml>,
   content: ReturnType<ReturnType<typeof loadHtml>>,
+  reporter: ScrapeReporter | undefined,
+  path: string,
 ): CourseRelationGroup[] {
-  const groups: CourseRelationGroup[] = [];
-  let sourceCodes: string[] = [];
-
-  const appendGroup = () => {
-    const uniqueCodes = [...new Set(sourceCodes)];
-    if (uniqueCodes.length > 0) groups.push({ sourceCodes: uniqueCodes });
-    sourceCodes = [];
-  };
-
-  content.contents().each((_, node) => {
-    if (node.type === "text") {
-      if ((node.data ?? "").includes("/")) appendGroup();
+  const alternatives: RelationToken[][] = [[]];
+  const issue = (message: string, actual: unknown) =>
+    reporter?.issue({
+      blocksCompleteness: true,
+      code: "unrecognized-content",
+      path,
+      message,
+      actual,
+    });
+  const visit = (node: Parameters<typeof $>[0]) => {
+    const element = $(node);
+    const dom = element[0];
+    if (!dom) return;
+    if (dom.type === "comment") return;
+    if (dom.type === "text") {
+      const parts = (dom.data ?? "").split("/");
+      parts.forEach((raw, index) => {
+        if (index > 0) alternatives.push([]);
+        alternatives.at(-1)!.push({ raw });
+      });
       return;
     }
-    if (node.type !== "tag" || node.name !== "a") return;
-    const code = canonicalCode(normalizedText($(node)));
-    if (code) sourceCodes.push(code);
-  });
-  appendGroup();
+    if (dom.type === "tag" && dom.name === "a") {
+      const raw = element.text();
+      const code = canonicalCode(
+        raw.replace(/^\s*\*+\s*/, "").replace(/\s*\*+\s*$/, ""),
+      );
+      alternatives.at(-1)!.push({
+        raw,
+        member: validCourseCode(code)
+          ? {
+              code,
+              prerequisiteOnlyMarker: raw.includes("*"),
+            }
+          : undefined,
+      });
+      return;
+    }
+    if (dom.type === "tag" && dom.name === "br") {
+      alternatives.at(-1)!.push({ raw: " " });
+      return;
+    }
+    element.contents().each((_, child) => visit(child));
+  };
+  content.contents().each((_, node) => visit(node));
+
+  const groups: CourseRelationGroup[] = [];
+  for (const tokens of alternatives) {
+    const rawText = tokens
+      .map((token) => token.raw)
+      .join("")
+      .replace(/\s+/g, " ")
+      .trim();
+    let invalid = false;
+    let offset = 0;
+    const positioned = tokens.map((token) => {
+      const start = offset;
+      offset += token.raw.length;
+      return { ...token, start, end: offset };
+    });
+    const members = positioned.filter((token) => token.member);
+    for (const token of positioned) {
+      if (token.member) continue;
+      if (/[^\s*]/.test(token.raw)) {
+        issue("Conteúdo da alternativa não reconhecido", token.raw);
+        invalid = true;
+      }
+      for (const match of token.raw.matchAll(/\*/g)) {
+        const position = token.start + match.index!;
+        const before = members
+          .filter((member) => member.end <= position)
+          .at(-1);
+        const after = members.find((member) => member.start > position);
+        const leftDistance = before ? position - before.end : Infinity;
+        const rightDistance = after ? after.start - position - 1 : Infinity;
+        const selected =
+          leftDistance === 0 && rightDistance !== 0
+            ? before
+            : rightDistance === 0 && leftDistance !== 0
+              ? after
+              : !before
+                ? after
+                : !after
+                  ? before
+                  : undefined;
+        if (!selected?.member) {
+          issue("Associação do asterisco ambígua", rawText);
+          invalid = true;
+        } else selected.member.prerequisiteOnlyMarker = true;
+      }
+    }
+    if (members.length === 0) {
+      issue("Alternativa vazia ou sem códigos válidos", rawText);
+      continue;
+    }
+    if (invalid) continue;
+    groups.push({
+      members: [
+        ...new Map(
+          members.map(({ member }) => [JSON.stringify(member), member!]),
+        ).values(),
+      ],
+      rawText,
+    });
+  }
   return groups;
+}
+
+function groupKey(group: CourseRelationGroup): string {
+  return JSON.stringify(
+    group.members
+      .map((member) =>
+        JSON.stringify([member.code, member.prerequisiteOnlyMarker]),
+      )
+      .sort(),
+  );
 }
 
 export const continenciaEquivalenciaInitial: PageAdapter<
@@ -200,8 +360,10 @@ export async function crawlContinenciaEquivalencia(
   input: ContinenciaEquivalenciaInput,
   context: ScrapingContext,
 ): Promise<ScrapeResult<ContinenciaEquivalenciaData>> {
-  const index = await context.load(continenciaEquivalenciaIndex, input);
-  const pages = await context.map(index.data.initials, async (initial) =>
+  const issueStart = context.issues.length;
+  const index = await context.tryLoad(continenciaEquivalenciaIndex, input);
+  const initials = index?.data.initials ?? [];
+  const pages = await context.map(initials, async (initial) =>
     context.tryLoad(continenciaEquivalenciaInitial, initial),
   );
   const relationByTarget = new Map<string, CourseRelation>();
@@ -210,15 +372,52 @@ export async function crawlContinenciaEquivalencia(
     for (const relation of page?.data.relations ?? []) {
       const existing = relationByTarget.get(relation.targetCode);
       if (!existing) {
-        relationByTarget.set(relation.targetCode, relation);
+        const keys = new Set<string>();
+        relationByTarget.set(relation.targetCode, {
+          ...relation,
+          groups: relation.groups.filter((group) => {
+            const key = groupKey(group);
+            if (keys.has(key)) return false;
+            keys.add(key);
+            return true;
+          }),
+        });
         continue;
       }
-      existing.groups.push(...relation.groups);
+      existing.sourceUrls = [
+        ...new Set([...existing.sourceUrls, ...relation.sourceUrls]),
+      ];
+      const keys = new Set(existing.groups.map(groupKey));
+      for (const group of relation.groups) {
+        const key = groupKey(group);
+        if (keys.has(key)) continue;
+        existing.groups.push(group);
+        keys.add(key);
+      }
     }
+
+  const issues = context.issues.slice(issueStart);
+  for (const issue of issues)
+    if (issue.code === "load-error") issue.blocksCompleteness = true;
 
   return {
     data: {
-      sourceUrl: index.data.sourceUrl,
+      sourceUrl:
+        index?.data.sourceUrl ?? input.url ?? continenciaEquivalenciaUrl,
+      coverage: {
+        expectedInitials: initials.map(({ initial }) => initial),
+        loadedInitials: initials
+          .filter((_, i) => pages[i])
+          .map(({ initial }) => initial),
+        failedInitials: initials
+          .filter((_, i) => !pages[i])
+          .map(({ initial }) => initial),
+        complete:
+          Boolean(index) &&
+          initials.length > 0 &&
+          pages.every(Boolean) &&
+          !issues.some((issue) => issue.blocksCompleteness),
+      },
       relations: [...relationByTarget.values()],
     },
     issues: context.issues,

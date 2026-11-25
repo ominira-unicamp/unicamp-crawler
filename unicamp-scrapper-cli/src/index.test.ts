@@ -75,3 +75,88 @@ test("editais-intercambio agrega as páginas abertas e fechadas", async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+for (const scenario of ["complete", "missing-page", "invalid-row"] as const) {
+  test(`continencia-equivalencia emite contrato e cobertura: ${scenario}`, async () => {
+    const server = createServer((request, response) => {
+      response.setHeader("content-type", "text/html; charset=utf-8");
+      if (request.url === "/index") {
+        response.end(
+          `<div id="iniciais"><a href="/M">M</a><a href="/F">F</a></div>`,
+        );
+      } else if (request.url === "/F" && scenario === "missing-page") {
+        response.statusCode = 503;
+        response.end("Indisponível");
+      } else {
+        const content =
+          request.url === "/F" && scenario === "invalid-row"
+            ? "<a>inválido</a>"
+            : "*<a>MC101</a>";
+        response.end(
+          `<div class="row"><div class="disciplina"><a name="MC102">MC102</a></div><div class="continencia">${content}</div></div>`,
+        );
+      }
+    });
+    const directory = await mkdtemp(join(tmpdir(), "continencias-cli-"));
+    try {
+      await new Promise<void>((resolve) =>
+        server.listen(0, "127.0.0.1", resolve),
+      );
+      const address = server.address();
+      if (!address || typeof address === "string")
+        throw new Error("Servidor inválido");
+      const output = join(directory, "relations.json");
+      const args = [
+        cli,
+        "continencia-equivalencia",
+        "--url",
+        `http://127.0.0.1:${address.port}/index`,
+        "--no-cache",
+        "--request-interval",
+        "1",
+        "--retries",
+        "1",
+        "--output",
+        output,
+      ];
+      if (scenario === "complete") {
+        await run(process.execPath, args);
+      } else {
+        await assert.rejects(run(process.execPath, args), (error: unknown) => {
+          assert.equal((error as { code: number }).code, 1);
+          return true;
+        });
+      }
+      const result = JSON.parse(await readFile(output, "utf8"));
+      assert.equal(result.data.coverage.complete, scenario === "complete");
+      assert.deepEqual(result.data.coverage.expectedInitials, ["M", "F"]);
+      assert.deepEqual(
+        result.data.coverage.failedInitials,
+        scenario === "missing-page" ? ["F"] : [],
+      );
+      assert.deepEqual(
+        result.data.coverage.loadedInitials,
+        scenario === "missing-page" ? ["M"] : ["M", "F"],
+      );
+      assert.deepEqual(result.data.relations[0].groups, [
+        {
+          members: [{ code: "MC101", prerequisiteOnlyMarker: true }],
+          rawText: "*MC101",
+        },
+      ]);
+      assert.ok(!("sourceCodes" in result.data.relations[0].groups[0]));
+      assert.ok(
+        result.data.relations[0].sourceUrls.includes(
+          `http://127.0.0.1:${address.port}/M`,
+        ),
+      );
+      assert.equal(result.issues.length === 0, scenario === "complete");
+      assert.ok(result.pages.length >= 2);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}
